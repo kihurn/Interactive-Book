@@ -73,8 +73,17 @@ export class BookSceneController {
   private frameId = 0;
   private previewAnimId = 0;
   private parallaxAnimId = 0;
+  private parallaxLastMs = 0;
+  private preloadQueueTimer = 0;
   private disposed = false;
   private isDocumentHidden = false;
+
+  private static readonly AXIS_Y = new THREE.Vector3(0, 1, 0);
+  private static readonly AXIS_X = new THREE.Vector3(1, 0, 0);
+  private tmpCamBase = new THREE.Vector3();
+  private tmpCamTarget = new THREE.Vector3();
+  private tmpCamOffset = new THREE.Vector3();
+  private tmpBoundCorners = Array.from({ length: 8 }, () => new THREE.Vector3());
 
   private pageHandles = new Map<string, PageTextureHandle>();
   private state: BookControllerState;
@@ -167,24 +176,33 @@ export class BookSceneController {
     return side === 'left' ? spread.left : spread.right;
   }
 
-  private getTargetSupersampleScale(): number {
+  private getReadingSupersampleScale(): number {
     const width = Math.max(1, this.container.clientWidth || window.innerWidth);
     const dpr = window.devicePixelRatio || 1;
     const maxTextureSize = this.renderer?.capabilities.maxTextureSize ?? 4096;
-    return computePageSupersampleScale({
-      phase: this.state.phase,
+    const computed = computePageSupersampleScale({
+      phase: 'open',
       viewportWidth: width,
       dpr,
       isSoftwareGl: this.isSoftwareGl,
       maxTextureSize,
     });
+    // Cap at 1.75x (~3360x1890) on high-DPI GPU so crispness remains high with half the upload bandwidth of 4K
+    return this.isSoftwareGl ? computed : Math.min(1.75, computed);
+  }
+
+  private invalidateShadows() {
+    if (this.renderer && !this.isSoftwareGl) {
+      this.renderer.shadowMap.needsUpdate = true;
+    }
   }
 
   private syncPageSupersampling() {
-    const targetScale = this.getTargetSupersampleScale();
+    const targetScale = this.getReadingSupersampleScale();
     let changed = false;
     this.pageHandles.forEach((handle) => {
       if (handle.setSupersampleScale(targetScale)) {
+        this.renderer?.initTexture?.(handle.texture);
         changed = true;
       }
     });
@@ -204,7 +222,7 @@ export class BookSceneController {
     if (existing) return existing;
 
     const slot = this.getPageSlot(spreadIdx, side);
-    const maxAniso = this.renderer ? Math.min(16, this.renderer.capabilities.getMaxAnisotropy()) : 4;
+    const maxAniso = this.renderer ? Math.min(8, this.renderer.capabilities.getMaxAnisotropy()) : 4;
     const handle = createPageTextureHandle(
       slot,
       side,
@@ -213,20 +231,50 @@ export class BookSceneController {
       () => {
         if (!this.disposed) this.requestRender();
       },
-      this.getTargetSupersampleScale(),
+      this.getReadingSupersampleScale(),
     );
+    this.renderer?.initTexture?.(handle.texture);
     this.pageHandles.set(key, handle);
     return handle;
   }
 
-  private preloadAdjacentSpreads(centerSpread: number) {
-    const indices = [centerSpread - 1, centerSpread, centerSpread + 1].filter(
+  private scheduleIdlePreload(centerSpread: number) {
+    if (this.disposed) return;
+    if (this.preloadQueueTimer) {
+      clearTimeout(this.preloadQueueTimer);
+      this.preloadQueueTimer = 0;
+    }
+
+    const pending: Array<{ spreadIdx: number; side: PageSide }> = [];
+    const order = [centerSpread + 1, centerSpread - 1].filter(
       (i) => i >= 0 && i < BOOK_SPREADS.length,
     );
-    for (const idx of indices) {
-      this.getOrCreatePageHandle(idx, 'left');
-      this.getOrCreatePageHandle(idx, 'right');
+    for (const idx of order) {
+      if (!this.pageHandles.has(this.getSlotKey(idx, 'left'))) {
+        pending.push({ spreadIdx: idx, side: 'left' });
+      }
+      if (!this.pageHandles.has(this.getSlotKey(idx, 'right'))) {
+        pending.push({ spreadIdx: idx, side: 'right' });
+      }
     }
+    if (pending.length === 0) return;
+
+    const processNext = () => {
+      this.preloadQueueTimer = 0;
+      if (this.disposed || this.isDocumentHidden) return;
+      if (this.activeTimeline?.isActive() || this.dragState?.active) {
+        this.preloadQueueTimer = window.setTimeout(processNext, 140);
+        return;
+      }
+      const next = pending.shift();
+      if (!next) return;
+      this.getOrCreatePageHandle(next.spreadIdx, next.side);
+      if (pending.length > 0) {
+        this.preloadQueueTimer = window.setTimeout(processNext, this.isSoftwareGl ? 120 : 32);
+      }
+    };
+
+    this.preloadQueueTimer = window.setTimeout(processNext, this.isSoftwareGl ? 160 : 60);
   }
 
   private getViewportTier(): 'desktop' | 'tablet' | 'mobile' {
@@ -252,8 +300,8 @@ export class BookSceneController {
   }
 
   private applyCameraFromProxy() {
-    const basePos = new THREE.Vector3(this.animProxy.camX, this.animProxy.camY, this.animProxy.camZ);
-    const target = new THREE.Vector3(
+    this.tmpCamBase.set(this.animProxy.camX, this.animProxy.camY, this.animProxy.camZ);
+    this.tmpCamTarget.set(
       this.animProxy.targetX,
       this.animProxy.targetY,
       this.animProxy.targetZ,
@@ -266,14 +314,14 @@ export class BookSceneController {
         this.theme.interaction.cursorYawMaxRad,
         this.theme.interaction.cursorPitchMaxRad,
       );
-      const offset = basePos.clone().sub(target);
-      offset.applyAxisAngle(new THREE.Vector3(0, 1, 0), yawRad);
-      offset.applyAxisAngle(new THREE.Vector3(1, 0, 0), pitchRad);
-      basePos.copy(target).add(offset);
+      this.tmpCamOffset.copy(this.tmpCamBase).sub(this.tmpCamTarget);
+      this.tmpCamOffset.applyAxisAngle(BookSceneController.AXIS_Y, yawRad);
+      this.tmpCamOffset.applyAxisAngle(BookSceneController.AXIS_X, pitchRad);
+      this.tmpCamBase.copy(this.tmpCamTarget).add(this.tmpCamOffset);
     }
 
-    this.camera.position.copy(basePos);
-    this.camera.lookAt(target);
+    this.camera.position.copy(this.tmpCamBase);
+    this.camera.lookAt(this.tmpCamTarget);
     if (Math.abs(this.camera.fov - this.animProxy.fov) > 0.05) {
       this.camera.fov = this.animProxy.fov;
       this.camera.updateProjectionMatrix();
@@ -283,6 +331,7 @@ export class BookSceneController {
   private syncPropsForViewport() {
     const tier = this.getViewportTier();
     this.propsRig.applyLayout(this.theme.props[tier]);
+    this.invalidateShadows();
   }
 
   private createLamplitStudioEnvScene(): THREE.Scene {
@@ -359,27 +408,27 @@ export class BookSceneController {
     const halfH = this.theme.bookDimensions.pageHeight * 0.5 + this.theme.bookDimensions.coverOverhang;
     const maxY = 0.16;
 
-    const corners = [
-      new THREE.Vector3(minLocalX, 0, -halfH),
-      new THREE.Vector3(maxLocalX, 0, -halfH),
-      new THREE.Vector3(minLocalX, 0, halfH),
-      new THREE.Vector3(maxLocalX, 0, halfH),
-      new THREE.Vector3(minLocalX, maxY, -halfH),
-      new THREE.Vector3(maxLocalX, maxY, -halfH),
-      new THREE.Vector3(minLocalX, maxY, halfH),
-      new THREE.Vector3(maxLocalX, maxY, halfH),
-    ];
+    const c = this.tmpBoundCorners;
+    c[0].set(minLocalX, 0, -halfH);
+    c[1].set(maxLocalX, 0, -halfH);
+    c[2].set(minLocalX, 0, halfH);
+    c[3].set(maxLocalX, 0, halfH);
+    c[4].set(minLocalX, maxY, -halfH);
+    c[5].set(maxLocalX, maxY, -halfH);
+    c[6].set(minLocalX, maxY, halfH);
+    c[7].set(maxLocalX, maxY, halfH);
 
     let uMin = 1;
     let vMin = 1;
     let uMax = 0;
     let vMax = 0;
 
-    for (const c of corners) {
-      c.applyMatrix4(this.bookRig.group.matrixWorld);
-      c.project(this.camera);
-      const u = c.x * 0.5 + 0.5;
-      const v = c.y * 0.5 + 0.5;
+    for (let i = 0; i < 8; i++) {
+      const pt = c[i];
+      pt.applyMatrix4(this.bookRig.group.matrixWorld);
+      pt.project(this.camera);
+      const u = pt.x * 0.5 + 0.5;
+      const v = pt.y * 0.5 + 0.5;
       uMin = Math.min(uMin, u);
       vMin = Math.min(vMin, v);
       uMax = Math.max(uMax, u);
@@ -429,6 +478,7 @@ export class BookSceneController {
       );
       this.renderer.setSize(width, height);
       this.renderer.shadowMap.enabled = !this.isSoftwareGl;
+      this.renderer.shadowMap.autoUpdate = false;
       this.renderer.shadowMap.type = THREE.PCFShadowMap;
       this.renderer.domElement.style.display = 'block';
       this.renderer.domElement.style.width = '100%';
@@ -561,7 +611,7 @@ export class BookSceneController {
       this.composer.addPass(this.gradingPass);
       this.composer.addPass(new OutputPass());
 
-      const maxAniso = Math.min(16, this.renderer.capabilities.getMaxAnisotropy());
+      const maxAniso = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
       const deskTextures = createDeskTextures(this.theme, maxAniso);
       const staticTextures = createBookStaticTextures(this.theme, SITE_CONFIG.brandName, maxAniso);
 
@@ -630,8 +680,7 @@ export class BookSceneController {
       this.syncPropsForViewport();
       this.scene.add(this.propsRig.group);
 
-      // Preload initial spreads and apply textures
-      this.preloadAdjacentSpreads(this.state.currentSpread);
+      // Build current spread at reading scale upfront (eliminates CPU/GPU texture upload spikes on openBook)
       const contentsH = this.getOrCreatePageHandle(0, 'left');
       this.bookRig.setContentsTexture(contentsH.texture);
       const leftH = this.getOrCreatePageHandle(this.state.currentSpread, 'left');
@@ -644,14 +693,20 @@ export class BookSceneController {
         this.animProxy.openProgress,
       );
 
+      // Pre-compile all book shaders (including turning sheet materials) before first interaction
       if (!this.isSoftwareGl) {
+        const sheet0 = this.bookRig.turningSheets[0];
+        if (sheet0) sheet0.mesh.visible = true;
         this.renderer.compile(this.scene, this.camera);
+        if (sheet0) sheet0.mesh.visible = false;
       }
+      this.invalidateShadows();
 
       this.bindEvents();
       this.requestRender();
       this.callbacks.onStateChange({ ...this.state });
       this.callbacks.onReady();
+      this.scheduleIdlePreload(this.state.currentSpread);
 
       this.cleanupFns.push(() => {
         envRT.dispose();
@@ -753,9 +808,9 @@ export class BookSceneController {
         this.handleDragPointerMove(e);
         return;
       }
-      if (e.pointerType === 'touch') return;
+      if (e.pointerType === 'touch' || this.activeTimeline?.isActive()) return;
       const now = performance.now();
-      if (now - this.lastRaycastMs < 35) return;
+      if (now - this.lastRaycastMs < 40) return;
       this.lastRaycastMs = now;
       this.handleHoverRaycast(e);
     };
@@ -809,30 +864,46 @@ export class BookSceneController {
   }
 
   private ensureParallaxLoop() {
-    if (this.parallaxAnimId || this.disposed || this.reducedMotion) return;
-    const tick = () => {
-      if (this.disposed || this.reducedMotion) {
-        this.parallaxAnimId = 0;
+    if (
+      this.parallaxAnimId ||
+      this.disposed ||
+      this.reducedMotion ||
+      this.activeTimeline?.isActive() ||
+      this.dragState?.active
+    ) {
+      return;
+    }
+    this.parallaxLastMs = performance.now();
+    const tick = (now: number) => {
+      this.parallaxAnimId = 0;
+      if (
+        this.disposed ||
+        this.reducedMotion ||
+        this.activeTimeline?.isActive() ||
+        this.dragState?.active
+      ) {
         return;
       }
+      const dtSec = Math.min(0.05, Math.max(0.004, (now - this.parallaxLastMs) / 1000));
+      this.parallaxLastMs = now;
+
       const dx = this.cursorTargetNdc.x - this.cursorCurrentNdc.x;
       const dy = this.cursorTargetNdc.y - this.cursorCurrentNdc.y;
-      const factor = this.isSoftwareGl ? 0.35 : 0.14;
-      this.cursorCurrentNdc.x += dx * factor;
-      this.cursorCurrentNdc.y += dy * factor;
+      const alpha = this.isSoftwareGl ? 0.35 : 1 - Math.exp(-12 * dtSec);
+      this.cursorCurrentNdc.x += dx * alpha;
+      this.cursorCurrentNdc.y += dy * alpha;
 
       this.applyCameraFromProxy();
       this.requestRender();
 
-      if (Math.abs(dx) > 0.002 || Math.abs(dy) > 0.002) {
-        this.parallaxAnimId = window.setTimeout(tick, this.isSoftwareGl ? 45 : 16);
+      if (Math.abs(dx) > 0.0025 || Math.abs(dy) > 0.0025) {
+        this.parallaxAnimId = requestAnimationFrame(tick);
       } else {
         this.cursorCurrentNdc.copy(this.cursorTargetNdc);
         this.applyCameraFromProxy();
-        this.parallaxAnimId = 0;
       }
     };
-    this.parallaxAnimId = window.setTimeout(tick, 16);
+    this.parallaxAnimId = requestAnimationFrame(tick);
   }
 
   private updateNdcFromClient(clientX: number, clientY: number) {
@@ -857,6 +928,7 @@ export class BookSceneController {
       ease: 'power2.out',
       onUpdate: () => {
         this.bookRig.setHoverLiftAngle(this.hoverProxy.angle);
+        this.invalidateShadows();
         this.requestRender();
       },
     });
@@ -868,7 +940,7 @@ export class BookSceneController {
     this.raycaster.setFromCamera(this.pointerNdc, this.camera);
 
     if (this.state.phase === 'closed') {
-      const hits = this.raycaster.intersectObject(this.bookRig.group, true);
+      const hits = this.raycaster.intersectObjects(this.bookRig.closedHitTargets, false);
       const isHover = hits.length > 0;
       this.setCursorInteractive(isHover);
       if (isHover !== this.hoveredCover) {
@@ -1081,7 +1153,6 @@ export class BookSceneController {
       this.dragTween?.kill();
       this.state = startRes.nextState;
       this.callbacks.onStateChange({ ...this.state });
-      this.preloadAdjacentSpreads(startRes.toSpread);
 
       const prevLeftH = this.getOrCreatePageHandle(startRes.fromSpread, 'left');
       const prevRightH = this.getOrCreatePageHandle(startRes.fromSpread, 'right');
@@ -1172,6 +1243,7 @@ export class BookSceneController {
     progress: number,
   ) {
     this.updateDragTurnMesh(fromSpread, toSpread, direction, progress);
+    this.invalidateShadows();
     this.requestRender();
   }
 
@@ -1252,7 +1324,7 @@ export class BookSceneController {
 
     const proxy = { progress: drag.currentProgress };
     const remaining = Math.abs(endProgress - drag.currentProgress);
-    const durationSec = this.reducedMotion ? 0.08 : Math.max(0.24, Math.min(0.56, remaining * 0.62));
+    const durationSec = this.reducedMotion ? 0.08 : Math.max(0.28, Math.min(0.85, remaining * 0.85));
 
     this.dragTween?.kill();
     this.dragTween = gsap.to(proxy, {
@@ -1269,7 +1341,9 @@ export class BookSceneController {
         const settledRight = this.getOrCreatePageHandle(this.state.currentSpread, 'right');
         this.bookRig.setSpreadTextures(settledLeft.texture, settledRight.texture);
         this.bookRig.setStackHeights(this.state.currentSpread, PHYSICAL_SPREAD_COUNT, 1);
+        this.invalidateShadows();
         this.callbacks.onStateChange({ ...this.state });
+        this.scheduleIdlePreload(this.state.currentSpread);
         this.requestRender();
       },
     });
@@ -1281,7 +1355,7 @@ export class BookSceneController {
     this.raycaster.setFromCamera(this.pointerNdc, this.camera);
 
     if (this.state.phase === 'closed') {
-      const hits = this.raycaster.intersectObject(this.bookRig.group, true);
+      const hits = this.raycaster.intersectObjects(this.bookRig.closedHitTargets, false);
       if (hits.length > 0) {
         this.openBook();
       }
@@ -1335,12 +1409,15 @@ export class BookSceneController {
     this.hoverTween?.kill();
     this.hoverProxy.angle = 0;
     this.bookRig.setHoverLiftAngle(0);
+    if (this.parallaxAnimId) {
+      cancelAnimationFrame(this.parallaxAnimId);
+      this.parallaxAnimId = 0;
+    }
 
     this.state = beginOpen(this.state);
     this.callbacks.onStateChange({ ...this.state });
 
-    this.syncPageSupersampling();
-    this.preloadAdjacentSpreads(0);
+    // Spread 0 is pre-rendered & GPU-uploaded at reading resolution during init — zero frame-0 texture upload spike
     const leftH = this.getOrCreatePageHandle(0, 'left');
     const rightH = this.getOrCreatePageHandle(0, 'right');
     this.bookRig.setSpreadTextures(leftH.texture, rightH.texture);
@@ -1357,12 +1434,15 @@ export class BookSceneController {
         this.bookRig.setStackHeights(0, PHYSICAL_SPREAD_COUNT, this.animProxy.openProgress);
         this.applyPhaseLighting(this.animProxy.openProgress);
         this.applyCameraFromProxy();
+        this.invalidateShadows();
         this.requestRender();
       },
       onComplete: () => {
         this.applyPhaseLighting(1);
         this.state = finishOpen(this.state);
+        this.invalidateShadows();
         this.callbacks.onStateChange({ ...this.state });
+        this.scheduleIdlePreload(0);
         this.requestRender();
       },
     });
@@ -1413,7 +1493,7 @@ export class BookSceneController {
         this.bookRig.setStackHeights(0, PHYSICAL_SPREAD_COUNT, 0);
         this.applyPhaseLighting(0);
         this.state = finishClose(this.state);
-        this.syncPageSupersampling();
+        this.invalidateShadows();
         this.callbacks.onStateChange({ ...this.state });
         this.requestRender();
       },
@@ -1425,7 +1505,7 @@ export class BookSceneController {
     if (!this.reducedMotion && startingSpread > 0) {
       const sweepCount = Math.min(BOOK_TIMING.maxBatchSheets, startingSpread);
       const sweepDurSec = BOOK_TIMING.closeSweepDurationMs / 1000;
-      const staggerSec = 0.08;
+      const staggerSec = 0.11;
 
       const curLeftH = this.getOrCreatePageHandle(startingSpread, 'left');
       const curRightH = this.getOrCreatePageHandle(startingSpread, 'right');
@@ -1477,6 +1557,7 @@ export class BookSceneController {
           onUpdate: () => {
             this.bookRig.setStackHeights(stackTween.spreadPos, PHYSICAL_SPREAD_COUNT, 1);
             syncCloseSweepStackHeights();
+            this.invalidateShadows();
             this.requestRender();
           },
         },
@@ -1495,6 +1576,7 @@ export class BookSceneController {
             ease: 'power2.inOut',
             onUpdate: () => {
               this.bookRig.updateTurningSheetGeometry(i);
+              this.invalidateShadows();
               this.requestRender();
             },
           },
@@ -1510,6 +1592,7 @@ export class BookSceneController {
           });
           this.bookRig.setSpreadTextures(homeLeftH.texture, homeRightH.texture);
           this.bookRig.setStackHeights(0, PHYSICAL_SPREAD_COUNT, 1);
+          this.invalidateShadows();
           this.requestRender();
         },
         undefined,
@@ -1551,6 +1634,7 @@ export class BookSceneController {
           this.bookRig.setOpenProgress(this.animProxy.openProgress);
           this.bookRig.setStackHeights(0, PHYSICAL_SPREAD_COUNT, this.animProxy.openProgress);
           this.applyPhaseLighting(this.animProxy.openProgress);
+          this.invalidateShadows();
           this.requestRender();
         },
       },
@@ -1613,7 +1697,6 @@ export class BookSceneController {
 
     this.dragTween?.kill();
     this.clearHoverState();
-    this.preloadAdjacentSpreads(targetSpread);
 
     if (this.reducedMotion) {
       // Instantaneous spread swap for reduced motion
@@ -1623,8 +1706,10 @@ export class BookSceneController {
       this.bookRig.setStackHeights(targetSpread, PHYSICAL_SPREAD_COUNT, 1);
       const { nextState: settled } = finishTurn(this.state);
       this.state = settled;
+      this.invalidateShadows();
       this.callbacks.onStateChange({ ...this.state });
       this.reframeCamera();
+      this.scheduleIdlePreload(targetSpread);
       this.requestRender();
       return;
     }
@@ -1681,7 +1766,9 @@ export class BookSceneController {
         this.bookRig.setStackHeights(targetSpread, PHYSICAL_SPREAD_COUNT, 1);
         const { nextState: settled, queuedPlan } = finishTurn(this.state);
         this.state = settled;
+        this.invalidateShadows();
         this.callbacks.onStateChange({ ...this.state });
+        this.scheduleIdlePreload(targetSpread);
         this.requestRender();
 
         if (queuedPlan) {
@@ -1757,6 +1844,7 @@ export class BookSceneController {
           ease: 'power2.inOut',
           onUpdate: () => {
             this.bookRig.updateTurningSheetGeometry(i);
+            this.invalidateShadows();
             this.requestRender();
           },
         },
@@ -1827,7 +1915,8 @@ export class BookSceneController {
     this.dragTween?.kill();
     this.activeTimeline?.kill();
     this.stopPreviewLoop();
-    clearTimeout(this.parallaxAnimId);
+    cancelAnimationFrame(this.parallaxAnimId);
+    clearTimeout(this.preloadQueueTimer);
     clearTimeout(this.dragTickId);
     cancelAnimationFrame(this.frameId);
     clearTimeout(this.frameId);

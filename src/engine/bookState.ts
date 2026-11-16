@@ -101,9 +101,9 @@ export function computeTurnPlan(
   fromSpread: number,
   toSpread: number,
   maxBatchSheets = 3,
-  singleDurationMs = 760,
-  batchDurationMs = 560,
-  staggerMs = 90,
+  singleDurationMs = 1000,
+  batchDurationMs = 740,
+  staggerMs = 110,
 ): TurnPlan {
   const delta = toSpread - fromSpread;
   const direction: 'next' | 'prev' = delta >= 0 ? 'next' : 'prev';

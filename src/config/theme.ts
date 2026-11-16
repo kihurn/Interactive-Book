@@ -129,15 +129,15 @@ export interface BookTimingConfig {
 }
 
 export const BOOK_TIMING: BookTimingConfig = {
-  openDurationMs: 760,
-  closeDurationMs: 880,
-  closeSweepDurationMs: 560,
-  singleTurnDurationMs: 760,
-  batchTurnDurationMs: 560,
-  batchTurnStaggerMs: 85,
+  openDurationMs: 1400,
+  closeDurationMs: 1620,
+  closeSweepDurationMs: 960,
+  singleTurnDurationMs: 1000,
+  batchTurnDurationMs: 740,
+  batchTurnStaggerMs: 110,
   maxBatchSheets: 3,
   reducedMotionFadeMs: 140,
-  cameraReframeMs: 760,
+  cameraReframeMs: 1000,
 };
 
 export interface ContactConfig {

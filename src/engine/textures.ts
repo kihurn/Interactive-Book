@@ -52,8 +52,9 @@ export interface PageTextureHandle {
 }
 
 function seededNoise(x: number, y: number): number {
-  const n = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
-  return n - Math.floor(n);
+  let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
 }
 
 function fbm1D(x: number): number {
@@ -517,17 +518,33 @@ export function createBookStaticTextures(
   };
 }
 
+let cachedPaperToothCanvas: HTMLCanvasElement | null = null;
+function getPaperToothCanvas(): HTMLCanvasElement {
+  if (cachedPaperToothCanvas) return cachedPaperToothCanvas;
+  const c = document.createElement('canvas');
+  c.width = 256;
+  c.height = 256;
+  const pCtx = c.getContext('2d')!;
+  pCtx.fillStyle = 'rgba(20, 18, 12, 0.018)';
+  for (let i = 0; i < 160; i++) {
+    const px = seededNoise(i, 3) * 256;
+    const py = seededNoise(i, 9) * 256;
+    pCtx.fillRect(px, py, 2, 1.5);
+  }
+  cachedPaperToothCanvas = c;
+  return c;
+}
+
 function drawPaperBase(ctx: CanvasRenderingContext2D, w: number, h: number, baseHex: string) {
   ctx.fillStyle = baseHex;
   ctx.fillRect(0, 0, w, h);
 
-  // Subtle cotton paper tooth
+  // Subtle cotton paper tooth via cached pattern (single GPU/2D fill instead of 420 rects)
   ctx.save();
-  ctx.fillStyle = 'rgba(20, 18, 12, 0.018)';
-  for (let i = 0; i < 420; i++) {
-    const px = seededNoise(i, 3.1) * w;
-    const py = seededNoise(i, 9.7) * h;
-    ctx.fillRect(px, py, 2, 1.5);
+  const pat = ctx.createPattern(getPaperToothCanvas(), 'repeat');
+  if (pat) {
+    ctx.fillStyle = pat;
+    ctx.fillRect(0, 0, w, h);
   }
   // Soft perimeter edge tone so light paper borders cleanly against charcoal bookcloth without stair-step aliasing
   ctx.strokeStyle = 'rgba(130, 118, 100, 0.35)';

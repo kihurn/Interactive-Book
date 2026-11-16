@@ -21,6 +21,7 @@ export interface BookRig {
   insideCoverSurface: THREE.Mesh;
   leftPageSurface: THREE.Mesh;
   rightPageSurface: THREE.Mesh;
+  closedHitTargets: THREE.Object3D[];
   turningSheets: TurningSheetSlot[];
   setOpenProgress: (progress: number) => void;
   setStackHeights: (currentSpread: number, physicalSpreads: number, openProgress: number) => void;
@@ -509,6 +510,7 @@ export function createBookRig(
     insideCoverSurface,
     leftPageSurface,
     rightPageSurface,
+    closedHitTargets: [frontCoverMesh, backCoverMesh, spineMesh, rightBlockMesh],
     turningSheets,
     setOpenProgress,
     setStackHeights,

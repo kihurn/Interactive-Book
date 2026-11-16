@@ -1,5 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as THREE from 'three';
+import { BOOK_TIMING, LAMPLIT_DESK_THEME } from '../config/theme';
+import { createBookRig } from './BookMesh';
+import type { BookStaticTextureSet } from './textures';
 import {
   beginClose,
   beginDragTurn,
@@ -117,11 +121,12 @@ test('mobile single-page mode steps left -> right -> next spread left', () => {
   assert.equal(getStepTarget(state, 'next', true), null);
 });
 
-test('computeTurnPlan caps batch sheets for distant contents jumps', () => {
+test('computeTurnPlan caps batch sheets for distant contents jumps and matches BOOK_TIMING pacing', () => {
   const single = computeTurnPlan(0, 1);
   assert.equal(single.direction, 'next');
   assert.equal(single.sheetCount, 1);
   assert.equal(single.staggerMs, 0);
+  assert.equal(single.durationMs, 1000);
 
   const jump = computeTurnPlan(0, 4, 3, 760, 560, 90);
   assert.equal(jump.direction, 'next');
@@ -131,6 +136,11 @@ test('computeTurnPlan caps batch sheets for distant contents jumps', () => {
   const backJump = computeTurnPlan(4, 0, 3);
   assert.equal(backJump.direction, 'prev');
   assert.equal(backJump.sheetCount, 3);
+
+  assert.equal(BOOK_TIMING.openDurationMs, 1400);
+  assert.equal(BOOK_TIMING.singleTurnDurationMs, 1000);
+  assert.ok(BOOK_TIMING.closeDurationMs > BOOK_TIMING.openDurationMs);
+  assert.ok(BOOK_TIMING.closeSweepDurationMs > 800);
 });
 
 test('deformPageVertex anchors spine at x=0, avoids NaN, and clears asymmetric stacks without clipping', () => {
@@ -310,4 +320,43 @@ test('computeLampShadowOffset projects prop drop shadows away from lamp angle cl
   // World-to-local rotation reverses when rotated back by +rotationY
   const local = worldOffsetToLocal(0.06, -0.02, 0.42, 0.9);
   assert.ok(Number.isFinite(local.localDx) && Number.isFinite(local.localDz));
+});
+
+test('closedHitTargets only matches visible closed cover and ignores hidden left-side meshes', () => {
+  const stubTex = new THREE.Texture() as unknown as THREE.CanvasTexture;
+  const staticStub: BookStaticTextureSet = {
+    frontCoverMap: stubTex,
+    backCoverMap: stubTex,
+    coverRoughnessMap: stubTex,
+    coverBumpMap: stubTex,
+    stonewareMap: stubTex,
+    pageEdgeMap: stubTex,
+    coffeeLatteMap: stubTex,
+    businessCardMap: stubTex,
+    dispose: () => {},
+  };
+
+  const rig = createBookRig(LAMPLIT_DESK_THEME, staticStub, 2);
+  rig.group.updateMatrixWorld(true);
+
+  const raycaster = new THREE.Raycaster();
+  const down = new THREE.Vector3(0, -1, 0);
+
+  // Directly to the left of the closed book (-1.2, 0): must NOT hit closedHitTargets
+  raycaster.set(new THREE.Vector3(-1.2, 3, 0), down);
+  assert.equal(raycaster.intersectObjects(rig.closedHitTargets, false).length, 0);
+  // Confirm why group recursion failed before: group contains invisible left-side meshes there
+  assert.ok(raycaster.intersectObject(rig.group, true).length > 0);
+
+  // Center of the closed cover (0.0, 0): must hit frontCoverMesh cleanly
+  raycaster.set(new THREE.Vector3(0, 3, 0), down);
+  const coverHits = raycaster.intersectObjects(rig.closedHitTargets, false);
+  assert.ok(coverHits.length > 0);
+  assert.equal(coverHits[0].object, rig.frontCoverMesh);
+
+  // Outside right edge (+1.2, 0): must NOT hit closedHitTargets
+  raycaster.set(new THREE.Vector3(1.2, 3, 0), down);
+  assert.equal(raycaster.intersectObjects(rig.closedHitTargets, false).length, 0);
+
+  rig.dispose();
 });
