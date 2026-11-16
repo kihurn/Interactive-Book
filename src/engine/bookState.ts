@@ -360,3 +360,228 @@ export function computeCursorCameraOffset(
   };
 }
 
+export interface DragTurnStartResult {
+  nextState: BookControllerState;
+  startedSheetDrag: boolean;
+  sameSpreadMobileSide: PageSide | null;
+  fromSpread: number;
+  toSpread: number;
+}
+
+/**
+ * Begins an interactive drag-to-flip gesture from the resting open state.
+ */
+export function beginDragTurn(
+  state: BookControllerState,
+  direction: 'next' | 'prev',
+  isSinglePageMode: boolean,
+): DragTurnStartResult {
+  if (state.phase !== 'open') {
+    return {
+      nextState: state,
+      startedSheetDrag: false,
+      sameSpreadMobileSide: null,
+      fromSpread: state.currentSpread,
+      toSpread: state.currentSpread,
+    };
+  }
+
+  const target = getStepTarget(state, direction, isSinglePageMode);
+  if (!target) {
+    return {
+      nextState: state,
+      startedSheetDrag: false,
+      sameSpreadMobileSide: null,
+      fromSpread: state.currentSpread,
+      toSpread: state.currentSpread,
+    };
+  }
+
+  if (target.targetSpread === state.currentSpread) {
+    return {
+      nextState: state,
+      startedSheetDrag: false,
+      sameSpreadMobileSide: target.targetMobileSide,
+      fromSpread: state.currentSpread,
+      toSpread: state.currentSpread,
+    };
+  }
+
+  return {
+    nextState: {
+      ...state,
+      phase: 'turning',
+      targetSpread: target.targetSpread,
+      mobileSide: target.targetMobileSide,
+      queuedNavigation: null,
+    },
+    startedSheetDrag: true,
+    sameSpreadMobileSide: null,
+    fromSpread: state.currentSpread,
+    toSpread: target.targetSpread,
+  };
+}
+
+/**
+ * Decides whether a released drag gesture commits to the next/previous spread or springs back.
+ * Requires a deliberate hold-and-drag across at least half the turn span (or a strong committed flick).
+ */
+export function resolveDragRelease(params: {
+  direction: 'next' | 'prev';
+  progress: number;
+  velocityPxPerMs: number;
+  commitThreshold?: number;
+  velocityThreshold?: number;
+  minFlickProgress?: number;
+}): { committed: boolean; endProgress: number } {
+  const threshold = params.commitThreshold ?? 0.52;
+  const vThreshold = params.velocityThreshold ?? 0.95;
+  const minFlick = params.minFlickProgress ?? 0.22;
+  const p = Math.max(0, Math.min(1, params.progress));
+
+  if (params.direction === 'next') {
+    const committed =
+      p >= threshold || (p >= minFlick && params.velocityPxPerMs <= -vThreshold);
+    return { committed, endProgress: committed ? 1 : 0 };
+  }
+
+  const committed =
+    p <= 1 - threshold || (p <= 1 - minFlick && params.velocityPxPerMs >= vThreshold);
+  return { committed, endProgress: committed ? 0 : 1 };
+}
+
+/**
+ * Settles state after a drag turn completes or springs back to its origin spread.
+ */
+export function finishDragTurn(
+  state: BookControllerState,
+  committed: boolean,
+): BookControllerState {
+  if (state.phase !== 'turning') return state;
+  const settledSpread = committed ? state.targetSpread : state.currentSpread;
+  return {
+    ...state,
+    phase: 'open',
+    currentSpread: settledSpread,
+    targetSpread: settledSpread,
+    queuedNavigation: null,
+  };
+}
+
+export interface PhaseLightingValues {
+  spotIntensity: number;
+  spotAngle: number;
+  spotPenumbra: number;
+  keyIntensity: number;
+  keyPosX: number;
+  keyPosY: number;
+  keyPosZ: number;
+  hemiIntensity: number;
+  rimIntensity: number;
+  environmentIntensity: number;
+}
+
+/**
+ * Maps the book's continuous opening progress (0 = closed, 1 = open) to dynamic
+ * overhead lamp intensity, cone spread, shadow-casting key direction, and restrained
+ * ambient fill so desk surface & prop lighting responds dynamically to the book phase.
+ */
+export function computePhaseLighting(
+  openProgress: number,
+  base: {
+    spotIntensity: number;
+    spotAngle: number;
+    spotPenumbra: number;
+    keyIntensity: number;
+    keyPosition: { x: number; y: number; z: number };
+    hemiIntensity: number;
+    rimIntensity: number;
+  },
+): PhaseLightingValues {
+  const p = Math.max(0, Math.min(1, openProgress));
+  const smooth = p * p * (3 - 2 * p);
+
+  return {
+    spotIntensity: base.spotIntensity * (0.9 + 0.16 * smooth),
+    spotAngle: Math.min(Math.PI * 0.49, base.spotAngle * (0.96 + 0.08 * smooth)),
+    spotPenumbra: Math.min(1, base.spotPenumbra * (0.97 + 0.03 * smooth)),
+    keyIntensity: base.keyIntensity * (0.92 + 0.14 * smooth),
+    keyPosX: base.keyPosition.x + 0.12 * smooth,
+    keyPosY: base.keyPosition.y + 0.14 * smooth,
+    keyPosZ: base.keyPosition.z - 0.08 * smooth,
+    hemiIntensity: base.hemiIntensity * (1.04 - 0.14 * smooth),
+    rimIntensity: base.rimIntensity * (0.92 + 0.14 * smooth),
+    environmentIntensity: 0.22 + 0.08 * smooth,
+  };
+}
+
+/**
+ * Computes the dynamic supersampling multiplier for static book page CanvasTextures.
+ * Scales smoothly between closed overview (1.25x) and open reading close-up (up to 2.0x = 3840x2160)
+ * while respecting GPU maxTextureSize and software WebGL headroom.
+ */
+export function computePageSupersampleScale(params: {
+  phase: BookPhase;
+  viewportWidth: number;
+  dpr: number;
+  isSoftwareGl: boolean;
+  maxTextureSize?: number;
+}): number {
+  const maxTex = Math.max(2048, params.maxTextureSize ?? 4096);
+  const maxAllowed = Math.min(2.0, maxTex / 1920);
+  const isReadingView =
+    params.phase === 'open' || params.phase === 'opening' || params.phase === 'turning';
+
+  if (params.isSoftwareGl) {
+    return Math.min(maxAllowed, isReadingView ? 1.5 : 1.0);
+  }
+
+  const effectiveDpr = Math.max(1, Math.min(2, params.dpr || 1));
+  const widthBoost = params.viewportWidth >= 1024 ? 1.0 : 0.88;
+  const target = isReadingView ? Math.max(1.5, Math.min(2.0, effectiveDpr * 1.35 * widthBoost)) : 1.25;
+  return Math.max(1.0, Math.min(maxAllowed, Math.round(target * 4) / 4));
+}
+
+/**
+ * Projects a prop's world XZ coordinates away from the overhead desk lamp onto the tabletop plane,
+ * returning clamped world-space drop-shadow offsets matching the lamp's physical angle.
+ */
+export function computeLampShadowOffset(params: {
+  propX: number;
+  propZ: number;
+  lampX: number;
+  lampY: number;
+  lampZ: number;
+  castHeight: number;
+  maxOffset?: number;
+}): { worldDx: number; worldDz: number } {
+  const safeY = Math.max(0.5, params.lampY);
+  const scale = params.castHeight / safeY;
+  const rawDx = (params.propX - params.lampX) * scale;
+  const rawDz = (params.propZ - params.lampZ) * scale;
+  const maxOff = params.maxOffset ?? 0.12;
+  const mag = Math.hypot(rawDx, rawDz);
+  if (mag <= 1e-6 || mag <= maxOff) {
+    return { worldDx: rawDx, worldDz: rawDz };
+  }
+  const k = maxOff / mag;
+  return { worldDx: rawDx * k, worldDz: rawDz * k };
+}
+
+/**
+ * Rotates a world-space XZ shadow offset into a prop's local coordinate frame (compensating for Y rotation and scale).
+ */
+export function worldOffsetToLocal(
+  worldDx: number,
+  worldDz: number,
+  rotationY: number,
+  scale = 1,
+): { localDx: number; localDz: number } {
+  const c = Math.cos(rotationY);
+  const s = Math.sin(rotationY);
+  const invScale = scale > 1e-4 ? 1 / scale : 1;
+  return {
+    localDx: (worldDx * c - worldDz * s) * invScale,
+    localDz: (worldDx * s + worldDz * c) * invScale,
+  };
+}

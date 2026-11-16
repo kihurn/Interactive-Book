@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
@@ -15,20 +14,25 @@ import {
 import { createBookRig, type BookRig } from './BookMesh';
 import {
   beginClose,
+  beginDragTurn,
   beginOpen,
   computeCursorCameraOffset,
+  computePageSupersampleScale,
+  computePhaseLighting,
   computeTurnPlan,
   createInitialBookState,
   finishClose,
+  finishDragTurn,
   finishOpen,
   finishTurn,
   getStepTarget,
   requestSpreadNavigation,
+  resolveDragRelease,
   type BookControllerState,
   type PageSide,
 } from './bookState';
 import { createDeskProps, type DeskPropsRig } from './props';
-import { VignetteGradingShader } from './shaders';
+import { enhanceDeskShader, VignetteGradingShader } from './shaders';
 import {
   createBookStaticTextures,
   createDeskTextures,
@@ -58,6 +62,10 @@ export class BookSceneController {
   private camera!: THREE.PerspectiveCamera;
   private bookRig!: BookRig;
   private propsRig!: DeskPropsRig;
+  private keyLight!: THREE.DirectionalLight;
+  private deskLamp!: THREE.SpotLight;
+  private hemiLight!: THREE.HemisphereLight;
+  private rimLight!: THREE.DirectionalLight;
 
   private isSoftwareGl = false;
   private renderBusy = false;
@@ -82,6 +90,24 @@ export class BookSceneController {
   private cursorInteractive = false;
   private previewStartMs = 0;
   private activePreviewSide: PageSide | null = null;
+  private dragState: {
+    active: boolean;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    lastX: number;
+    lastTimeMs: number;
+    lastStepMs: number;
+    velocityPxPerMs: number;
+    direction: 'next' | 'prev' | null;
+    fromSpread: number;
+    toSpread: number;
+    targetProgress: number;
+    currentProgress: number;
+  } | null = null;
+  private dragTickId = 0;
+  private dragTween: gsap.core.Tween | null = null;
+  private suppressNextClick = false;
 
   private animProxy = {
     openProgress: 0,
@@ -141,16 +167,54 @@ export class BookSceneController {
     return side === 'left' ? spread.left : spread.right;
   }
 
+  private getTargetSupersampleScale(): number {
+    const width = Math.max(1, this.container.clientWidth || window.innerWidth);
+    const dpr = window.devicePixelRatio || 1;
+    const maxTextureSize = this.renderer?.capabilities.maxTextureSize ?? 4096;
+    return computePageSupersampleScale({
+      phase: this.state.phase,
+      viewportWidth: width,
+      dpr,
+      isSoftwareGl: this.isSoftwareGl,
+      maxTextureSize,
+    });
+  }
+
+  private syncPageSupersampling() {
+    const targetScale = this.getTargetSupersampleScale();
+    let changed = false;
+    this.pageHandles.forEach((handle) => {
+      if (handle.setSupersampleScale(targetScale)) {
+        changed = true;
+      }
+    });
+    if (changed && this.bookRig) {
+      const contentsH = this.getOrCreatePageHandle(0, 'left');
+      this.bookRig.setContentsTexture(contentsH.texture);
+      const leftH = this.getOrCreatePageHandle(this.state.currentSpread, 'left');
+      const rightH = this.getOrCreatePageHandle(this.state.currentSpread, 'right');
+      this.bookRig.setSpreadTextures(leftH.texture, rightH.texture);
+      this.requestRender();
+    }
+  }
+
   private getOrCreatePageHandle(spreadIdx: number, side: PageSide): PageTextureHandle {
     const key = this.getSlotKey(spreadIdx, side);
     const existing = this.pageHandles.get(key);
     if (existing) return existing;
 
     const slot = this.getPageSlot(spreadIdx, side);
-    const maxAniso = this.renderer ? Math.min(8, this.renderer.capabilities.getMaxAnisotropy()) : 4;
-    const handle = createPageTextureHandle(slot, side, SITE_CONFIG.brandName, maxAniso, () => {
-      if (!this.disposed) this.requestRender();
-    });
+    const maxAniso = this.renderer ? Math.min(16, this.renderer.capabilities.getMaxAnisotropy()) : 4;
+    const handle = createPageTextureHandle(
+      slot,
+      side,
+      SITE_CONFIG.brandName,
+      maxAniso,
+      () => {
+        if (!this.disposed) this.requestRender();
+      },
+      this.getTargetSupersampleScale(),
+    );
     this.pageHandles.set(key, handle);
     return handle;
   }
@@ -221,6 +285,131 @@ export class BookSceneController {
     this.propsRig.applyLayout(this.theme.props[tier]);
   }
 
+  private createLamplitStudioEnvScene(): THREE.Scene {
+    const envScene = new THREE.Scene();
+    envScene.background = new THREE.Color(0x0b0908);
+
+    // Overhead warm desk-lamp softbox placed upper-right so curved turns catch coated sheen without glaring over flat Contents ink
+    const softboxGeo = new THREE.PlaneGeometry(3.0, 1.6);
+    const softboxMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(1.45, 1.32, 1.15), side: THREE.DoubleSide });
+    const softbox = new THREE.Mesh(softboxGeo, softboxMat);
+    softbox.position.set(1.85, 5.2, -0.35);
+    softbox.lookAt(0, 0, 0);
+    envScene.add(softbox);
+
+    // Focused filament core inside the overhead lamp shade for specular highlights along curled sheets
+    const coreGeo = new THREE.CircleGeometry(0.55, 24);
+    const coreMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(2.8, 2.5, 2.15), side: THREE.DoubleSide });
+    const core = new THREE.Mesh(coreGeo, coreMat);
+    core.position.set(1.75, 5.05, -0.3);
+    core.lookAt(0, 0, 0);
+    envScene.add(core);
+
+    // Subtle cool skylight bounce strip behind the desk for crisp page-edge & brushed-metal separation
+    const rimStripGeo = new THREE.PlaneGeometry(7.0, 1.4);
+    const rimStripMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(1.2, 1.32, 1.5), side: THREE.DoubleSide });
+    const rimStrip = new THREE.Mesh(rimStripGeo, rimStripMat);
+    rimStrip.position.set(1.8, 2.4, -4.0);
+    rimStrip.lookAt(0, 0, 0);
+    envScene.add(rimStrip);
+
+    // Side highlight strip for polished metallic spoon & brass ferrule gleams
+    const metalStripGeo = new THREE.PlaneGeometry(1.4, 3.6);
+    const metalStripMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(2.2, 2.05, 1.85), side: THREE.DoubleSide });
+    const metalStrip = new THREE.Mesh(metalStripGeo, metalStripMat);
+    metalStrip.position.set(-2.8, 3.2, 1.6);
+    metalStrip.lookAt(0, 0, 0);
+    envScene.add(metalStrip);
+
+    // Broad soft studio ceiling & opposite-side fill cards so metallic concave spoon bowl reflects natural silver gradients
+    const metalFillGeo = new THREE.PlaneGeometry(5.6, 3.6);
+    const metalFillMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.72, 0.74, 0.78), side: THREE.DoubleSide });
+    const metalFill = new THREE.Mesh(metalFillGeo, metalFillMat);
+    metalFill.position.set(0.4, 4.8, 2.4);
+    metalFill.lookAt(0, 0, 0);
+    envScene.add(metalFill);
+
+    const metalSideGeo = new THREE.PlaneGeometry(2.6, 2.2);
+    const metalSideMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.58, 0.55, 0.52), side: THREE.DoubleSide });
+    const metalSide = new THREE.Mesh(metalSideGeo, metalSideMat);
+    metalSide.position.set(3.6, 2.4, 1.5);
+    metalSide.lookAt(0, 0, 0);
+    envScene.add(metalSide);
+
+    // Warm dark oak ambient floor bounce so underside of lifted page curls gets warm fill
+    const bounceGeo = new THREE.PlaneGeometry(8.0, 6.0);
+    const bounceMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.32, 0.24, 0.18), side: THREE.DoubleSide });
+    const bounce = new THREE.Mesh(bounceGeo, bounceMat);
+    bounce.position.set(0, -1.5, 0);
+    bounce.rotation.x = -Math.PI / 2;
+    envScene.add(bounce);
+
+    return envScene;
+  }
+
+  private updateBookShaderBounds() {
+    if (!this.gradingPass || !this.bookRig || !this.camera) return;
+    this.camera.updateMatrixWorld();
+    this.bookRig.group.updateMatrixWorld(true);
+
+    const openFactor = this.animProxy.openProgress;
+    const halfW = this.theme.bookDimensions.pageWidth + this.theme.bookDimensions.coverOverhang;
+    const minLocalX = openFactor > 0.08 ? -halfW : -0.04;
+    const maxLocalX = halfW;
+    const halfH = this.theme.bookDimensions.pageHeight * 0.5 + this.theme.bookDimensions.coverOverhang;
+    const maxY = 0.16;
+
+    const corners = [
+      new THREE.Vector3(minLocalX, 0, -halfH),
+      new THREE.Vector3(maxLocalX, 0, -halfH),
+      new THREE.Vector3(minLocalX, 0, halfH),
+      new THREE.Vector3(maxLocalX, 0, halfH),
+      new THREE.Vector3(minLocalX, maxY, -halfH),
+      new THREE.Vector3(maxLocalX, maxY, -halfH),
+      new THREE.Vector3(minLocalX, maxY, halfH),
+      new THREE.Vector3(maxLocalX, maxY, halfH),
+    ];
+
+    let uMin = 1;
+    let vMin = 1;
+    let uMax = 0;
+    let vMax = 0;
+
+    for (const c of corners) {
+      c.applyMatrix4(this.bookRig.group.matrixWorld);
+      c.project(this.camera);
+      const u = c.x * 0.5 + 0.5;
+      const v = c.y * 0.5 + 0.5;
+      uMin = Math.min(uMin, u);
+      vMin = Math.min(vMin, v);
+      uMax = Math.max(uMax, u);
+      vMax = Math.max(vMax, v);
+    }
+
+    this.gradingPass.uniforms.uBookBounds.value.set(
+      Math.max(0, Math.min(1, uMin)),
+      Math.max(0, Math.min(1, vMin)),
+      Math.max(0, Math.min(1, uMax)),
+      Math.max(0, Math.min(1, vMax)),
+    );
+    const isReading =
+      this.state.phase === 'open' || this.state.phase === 'turning' || openFactor > 0.7;
+    this.gradingPass.uniforms.uBookSharpen.value = isReading ? 0.85 : 0.28;
+  }
+
+  private applyPhaseLighting(openProgress: number) {
+    if (!this.deskLamp || !this.keyLight || !this.hemiLight || !this.rimLight) return;
+    const vals = computePhaseLighting(openProgress, this.theme.lighting);
+    this.deskLamp.intensity = vals.spotIntensity;
+    this.deskLamp.angle = vals.spotAngle;
+    this.deskLamp.penumbra = vals.spotPenumbra;
+    this.keyLight.intensity = vals.keyIntensity;
+    this.keyLight.position.set(vals.keyPosX, vals.keyPosY, vals.keyPosZ);
+    this.hemiLight.intensity = vals.hemiIntensity;
+    this.rimLight.intensity = vals.rimIntensity;
+    this.scene.environmentIntensity = vals.environmentIntensity;
+  }
+
   private init() {
     try {
       this.isSoftwareGl = this.detectSoftwareWebGL();
@@ -234,13 +423,13 @@ export class BookSceneController {
       this.renderer.outputColorSpace = THREE.SRGBColorSpace;
       this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
       this.renderer.toneMappingExposure = this.theme.lighting.exposure;
-      // Cap DPR up to 2 on GPU for sharp 16:9 canvas typography, or 1 on software WebGL
+      // Cap DPR up to 1.5 on GPU (matches 4x MSAA composer headroom smoothly), or 1 on software WebGL
       this.renderer.setPixelRatio(
-        this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2),
+        this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 1.5),
       );
       this.renderer.setSize(width, height);
       this.renderer.shadowMap.enabled = !this.isSoftwareGl;
-      this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      this.renderer.shadowMap.type = THREE.PCFShadowMap;
       this.renderer.domElement.style.display = 'block';
       this.renderer.domElement.style.width = '100%';
       this.renderer.domElement.style.height = '100%';
@@ -249,11 +438,19 @@ export class BookSceneController {
 
       this.scene = new THREE.Scene();
       this.scene.background = new THREE.Color(this.theme.palette.background);
-      this.scene.fog = new THREE.FogExp2(this.theme.palette.background, 0.165);
+      this.scene.fog = new THREE.FogExp2(this.theme.palette.background, 0.072);
 
       const pmrem = new THREE.PMREMGenerator(this.renderer);
-      this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-      this.scene.environmentIntensity = 0.14;
+      const envScene = this.createLamplitStudioEnvScene();
+      const envRT = pmrem.fromScene(envScene, 0.04);
+      this.scene.environment = envRT.texture;
+      envScene.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          obj.geometry.dispose();
+          if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+          else obj.material.dispose();
+        }
+      });
       pmrem.dispose();
 
       const initialPreset = this.getTargetCameraPreset();
@@ -270,67 +467,74 @@ export class BookSceneController {
       };
       this.applyCameraFromProxy();
 
-      // Lighting rig: sharp warm overhead desk SpotLight + subtle directional fill + cool hemi + rim
-      const keyLight = new THREE.DirectionalLight(
+      // Lighting rig: warm overhead desk SpotLight + angled shadow-casting keyLight mapped dynamically to book phase
+      this.keyLight = new THREE.DirectionalLight(
         this.theme.lighting.keyColor,
-        this.theme.lighting.keyIntensity * 0.65,
+        this.theme.lighting.keyIntensity,
       );
-      keyLight.position.set(
+      this.keyLight.position.set(
         this.theme.lighting.keyPosition.x,
         this.theme.lighting.keyPosition.y,
         this.theme.lighting.keyPosition.z,
       );
-      this.scene.add(keyLight);
+      this.keyLight.castShadow = !this.isSoftwareGl;
+      const shadowMapRes = this.isSoftwareGl ? 1024 : 2048;
+      this.keyLight.shadow.mapSize.set(shadowMapRes, shadowMapRes);
+      this.keyLight.shadow.camera.left = -2.6;
+      this.keyLight.shadow.camera.right = 2.6;
+      this.keyLight.shadow.camera.top = 1.7;
+      this.keyLight.shadow.camera.bottom = -1.7;
+      this.keyLight.shadow.camera.near = 0.6;
+      this.keyLight.shadow.camera.far = 8.5;
+      this.keyLight.shadow.bias = -0.00025;
+      this.keyLight.shadow.normalBias = 0.0028;
+      this.keyLight.shadow.radius = 4.5;
+      this.scene.add(this.keyLight);
 
-      const deskLamp = new THREE.SpotLight(
+      this.deskLamp = new THREE.SpotLight(
         this.theme.lighting.spotColor,
         this.theme.lighting.spotIntensity,
-        12.0,
+        14.0,
         this.theme.lighting.spotAngle,
         this.theme.lighting.spotPenumbra,
         this.theme.lighting.spotDecay,
       );
-      deskLamp.position.set(
+      this.deskLamp.position.set(
         this.theme.lighting.spotPosition.x,
         this.theme.lighting.spotPosition.y,
         this.theme.lighting.spotPosition.z,
       );
-      deskLamp.target.position.set(
+      this.deskLamp.target.position.set(
         this.theme.lighting.spotTarget.x,
         this.theme.lighting.spotTarget.y,
         this.theme.lighting.spotTarget.z,
       );
-      deskLamp.castShadow = !this.isSoftwareGl;
-      const shadowMapRes = this.isSoftwareGl ? 1024 : 2048;
-      deskLamp.shadow.mapSize.set(shadowMapRes, shadowMapRes);
-      deskLamp.shadow.camera.near = 0.8;
-      deskLamp.shadow.camera.far = 11;
-      deskLamp.shadow.bias = -0.0003;
-      deskLamp.shadow.normalBias = 0.014;
-      deskLamp.shadow.radius = 2.6;
-      this.scene.add(deskLamp.target);
-      this.scene.add(deskLamp);
+      this.deskLamp.castShadow = false;
+      this.scene.add(this.deskLamp.target);
+      this.scene.add(this.deskLamp);
 
-      const hemiLight = new THREE.HemisphereLight(
+      this.hemiLight = new THREE.HemisphereLight(
         this.theme.lighting.hemiSkyColor,
         this.theme.lighting.hemiGroundColor,
         this.theme.lighting.hemiIntensity,
       );
-      this.scene.add(hemiLight);
+      this.scene.add(this.hemiLight);
 
-      const rimLight = new THREE.DirectionalLight(
+      this.rimLight = new THREE.DirectionalLight(
         this.theme.lighting.rimColor,
         this.theme.lighting.rimIntensity,
       );
-      rimLight.position.set(
+      this.rimLight.position.set(
         this.theme.lighting.rimPosition.x,
         this.theme.lighting.rimPosition.y,
         this.theme.lighting.rimPosition.z,
       );
-      this.scene.add(rimLight);
+      this.scene.add(this.rimLight);
+
+      this.applyPhaseLighting(this.animProxy.openProgress);
 
       // Post-processing composer with 4x MSAA on GPU: RenderPass -> VignetteGradingShader -> OutputPass
-      const composerDpr = this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+      const composerDpr = this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 1.5);
       const composerTarget = new THREE.WebGLRenderTarget(
         Math.max(1, Math.round(width * composerDpr)),
         Math.max(1, Math.round(height * composerDpr)),
@@ -357,7 +561,7 @@ export class BookSceneController {
       this.composer.addPass(this.gradingPass);
       this.composer.addPass(new OutputPass());
 
-      const maxAniso = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+      const maxAniso = Math.min(16, this.renderer.capabilities.getMaxAnisotropy());
       const deskTextures = createDeskTextures(this.theme, maxAniso);
       const staticTextures = createBookStaticTextures(this.theme, SITE_CONFIG.brandName, maxAniso);
 
@@ -367,45 +571,62 @@ export class BookSceneController {
       const deskMat = new THREE.MeshStandardMaterial({
         map: deskTextures.baseColor,
         normalMap: deskTextures.normalMap,
-        normalScale: new THREE.Vector2(0.18, 0.18),
+        normalScale: new THREE.Vector2(0.36, 0.36),
         roughnessMap: deskTextures.roughnessMap,
         roughness: this.theme.materials.deskRoughness,
-        metalness: 0.04,
-        envMapIntensity: 0.16,
+        metalness: 0.0,
+        envMapIntensity: 0.14,
       });
+      enhanceDeskShader(deskMat);
       const deskMesh = new THREE.Mesh(deskGeo, deskMat);
-      deskMesh.receiveShadow = true;
+      deskMesh.receiveShadow = false;
       this.scene.add(deskMesh);
 
-      // Soft radial contact shadow directly beneath the 16:9 book
+      // Soft radial contact shadow directly beneath the 16:9 book + isolated shadow-catching plane
       const contactShadowCanvas = document.createElement('canvas');
       contactShadowCanvas.width = 256;
       contactShadowCanvas.height = 256;
       const csCtx = contactShadowCanvas.getContext('2d')!;
       const csGrad = csCtx.createRadialGradient(128, 128, 30, 128, 128, 124);
-      csGrad.addColorStop(0, 'rgba(0,0,0,0.64)');
-      csGrad.addColorStop(0.65, 'rgba(0,0,0,0.34)');
+      csGrad.addColorStop(0, 'rgba(0,0,0,0.58)');
+      csGrad.addColorStop(0.65, 'rgba(0,0,0,0.28)');
       csGrad.addColorStop(1, 'rgba(0,0,0,0)');
       csCtx.fillStyle = csGrad;
       csCtx.fillRect(0, 0, 256, 256);
       const contactShadowTex = new THREE.CanvasTexture(contactShadowCanvas);
-      const contactShadowGeo = new THREE.PlaneGeometry(3.4, 1.85);
+      const contactShadowGeo = new THREE.PlaneGeometry(2.82, 1.04);
       contactShadowGeo.rotateX(-Math.PI / 2);
       const contactShadowMat = new THREE.MeshBasicMaterial({
         map: contactShadowTex,
         transparent: true,
         depthWrite: false,
-        opacity: 0.72,
+        opacity: 0.48,
       });
       const contactShadow = new THREE.Mesh(contactShadowGeo, contactShadowMat);
-      contactShadow.position.y = 0.002;
+      contactShadow.position.y = 0.001;
+      contactShadow.renderOrder = 1;
       this.scene.add(contactShadow);
 
-      // Book rig & Props
+      const bookShadowCatcherGeo = new THREE.PlaneGeometry(2.82, 1.12);
+      bookShadowCatcherGeo.rotateX(-Math.PI / 2);
+      const bookShadowCatcherMat = new THREE.ShadowMaterial({
+        color: 0x050302,
+        opacity: 0.54,
+        transparent: true,
+        depthWrite: false,
+      });
+      const bookShadowCatcher = new THREE.Mesh(bookShadowCatcherGeo, bookShadowCatcherMat);
+      bookShadowCatcher.position.y = 0.0016;
+      bookShadowCatcher.receiveShadow = true;
+      bookShadowCatcher.renderOrder = 2;
+      this.scene.add(bookShadowCatcher);
+
+      // Book rig & Props (book offset cleanly above its shadow-catching plane)
       this.bookRig = createBookRig(this.theme, staticTextures, BOOK_TIMING.maxBatchSheets);
+      this.bookRig.group.position.y = 0.0036;
       this.scene.add(this.bookRig.group);
 
-      this.propsRig = createDeskProps(staticTextures);
+      this.propsRig = createDeskProps(staticTextures, this.theme.lighting.spotPosition);
       this.syncPropsForViewport();
       this.scene.add(this.propsRig.group);
 
@@ -433,6 +654,7 @@ export class BookSceneController {
       this.callbacks.onReady();
 
       this.cleanupFns.push(() => {
+        envRT.dispose();
         composerTarget.dispose();
         deskTextures.dispose();
         staticTextures.dispose();
@@ -441,6 +663,8 @@ export class BookSceneController {
         contactShadowTex.dispose();
         contactShadowGeo.dispose();
         contactShadowMat.dispose();
+        bookShadowCatcherGeo.dispose();
+        bookShadowCatcherMat.dispose();
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'WebGL initialization failed';
@@ -467,6 +691,7 @@ export class BookSceneController {
       this.composer?.setSize(w, h);
       this.gradingPass?.uniforms.uResolution.value.set(w, h);
       this.syncPropsForViewport();
+      this.syncPageSupersampling();
 
       // Smoothly reframe camera when resizing across viewport tiers
       if (this.state.phase === 'closed' || this.state.phase === 'open') {
@@ -485,7 +710,7 @@ export class BookSceneController {
     window.addEventListener('resize', onResize);
 
     const onWindowPointerMove = (e: PointerEvent) => {
-      if (e.pointerType === 'touch' || this.reducedMotion) return;
+      if (e.pointerType === 'touch' || this.reducedMotion || this.dragState?.active) return;
       const w = Math.max(1, window.innerWidth);
       const h = Math.max(1, window.innerHeight);
       this.cursorTargetNdc.set((e.clientX / w) * 2 - 1, -((e.clientY / h) * 2 - 1));
@@ -493,7 +718,41 @@ export class BookSceneController {
     };
     window.addEventListener('pointermove', onWindowPointerMove, { passive: true });
 
+    const onPointerDown = (e: PointerEvent) => {
+      if (e.button !== 0 || this.state.phase !== 'open' || this.disposed) return;
+      this.updateNdcFromClient(e.clientX, e.clientY);
+      this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+      const leftSurface =
+        this.state.currentSpread === 0 ? this.bookRig.insideCoverSurface : this.bookRig.leftPageSurface;
+      const hits = this.raycaster.intersectObjects(
+        [leftSurface, this.bookRig.rightPageSurface],
+        false,
+      );
+      if (hits.length === 0) return;
+
+      this.dragState = {
+        active: false,
+        pointerId: e.pointerId,
+        startX: e.clientX,
+        startY: e.clientY,
+        lastX: e.clientX,
+        lastTimeMs: performance.now(),
+        lastStepMs: performance.now(),
+        velocityPxPerMs: 0,
+        direction: null,
+        fromSpread: this.state.currentSpread,
+        toSpread: this.state.currentSpread,
+        targetProgress: 0,
+        currentProgress: 0,
+      };
+    };
+    canvas.addEventListener('pointerdown', onPointerDown);
+
     const onPointerMove = (e: PointerEvent) => {
+      if (this.dragState && e.pointerId === this.dragState.pointerId) {
+        this.handleDragPointerMove(e);
+        return;
+      }
       if (e.pointerType === 'touch') return;
       const now = performance.now();
       if (now - this.lastRaycastMs < 35) return;
@@ -502,12 +761,25 @@ export class BookSceneController {
     };
     canvas.addEventListener('pointermove', onPointerMove);
 
+    const onPointerUpOrCancel = (e: PointerEvent) => {
+      if (!this.dragState || e.pointerId !== this.dragState.pointerId) return;
+      this.finishDragGesture(e);
+    };
+    canvas.addEventListener('pointerup', onPointerUpOrCancel);
+    canvas.addEventListener('pointercancel', onPointerUpOrCancel);
+
     const onPointerLeave = () => {
-      this.clearHoverState();
+      if (!this.dragState?.active) {
+        this.clearHoverState();
+      }
     };
     canvas.addEventListener('pointerleave', onPointerLeave);
 
     const onClick = (e: MouseEvent) => {
+      if (this.suppressNextClick) {
+        this.suppressNextClick = false;
+        return;
+      }
       this.handleCanvasClick(e);
     };
     canvas.addEventListener('click', onClick);
@@ -526,7 +798,10 @@ export class BookSceneController {
       canvas.removeEventListener('webglcontextlost', onContextLost);
       window.removeEventListener('resize', onResize);
       window.removeEventListener('pointermove', onWindowPointerMove);
+      canvas.removeEventListener('pointerdown', onPointerDown);
       canvas.removeEventListener('pointermove', onPointerMove);
+      canvas.removeEventListener('pointerup', onPointerUpOrCancel);
+      canvas.removeEventListener('pointercancel', onPointerUpOrCancel);
       canvas.removeEventListener('pointerleave', onPointerLeave);
       canvas.removeEventListener('click', onClick);
       document.removeEventListener('visibilitychange', onVisibility);
@@ -593,7 +868,7 @@ export class BookSceneController {
     this.raycaster.setFromCamera(this.pointerNdc, this.camera);
 
     if (this.state.phase === 'closed') {
-      const hits = this.raycaster.intersectObject(this.bookRig.frontCoverMesh, false);
+      const hits = this.raycaster.intersectObject(this.bookRig.group, true);
       const isHover = hits.length > 0;
       this.setCursorInteractive(isHover);
       if (isHover !== this.hoveredCover) {
@@ -659,15 +934,24 @@ export class BookSceneController {
     }
   }
 
+  private restoreStaticPageTexture(side: PageSide) {
+    const handle = this.pageHandles.get(this.getSlotKey(this.state.currentSpread, side));
+    if (!handle) return;
+    handle.render(0, false);
+    const surface = side === 'left' ? this.bookRig.leftPageSurface : this.bookRig.rightPageSurface;
+    const mat = surface.material as THREE.MeshStandardMaterial;
+    if (mat.map !== handle.texture) {
+      mat.map = handle.texture;
+      mat.needsUpdate = true;
+    }
+  }
+
   private setActiveHoverProject(project: ProjectItem | null, side: PageSide | null) {
     if (this.hoveredSide === side && this.activePreviewSide === side) return;
 
-    // Reset previous hovered page back to static poster
+    // Reset previous hovered page back to full 1920x1080 static poster
     if (this.hoveredSide && this.hoveredSide !== side) {
-      const prevHandle = this.pageHandles.get(
-        this.getSlotKey(this.state.currentSpread, this.hoveredSide),
-      );
-      prevHandle?.render(0, false);
+      this.restoreStaticPageTexture(this.hoveredSide);
     }
 
     this.hoveredSide = side;
@@ -697,10 +981,7 @@ export class BookSceneController {
       this.hoveredContentsProjectId = null;
     }
     if (this.hoveredSide) {
-      const prevHandle = this.pageHandles.get(
-        this.getSlotKey(this.state.currentSpread, this.hoveredSide),
-      );
-      prevHandle?.render(0, false);
+      this.restoreStaticPageTexture(this.hoveredSide);
       this.hoveredSide = null;
       this.callbacks.onHoverProject(null, null);
     }
@@ -715,15 +996,22 @@ export class BookSceneController {
     this.activePreviewSide = side;
     this.previewStartMs = performance.now();
 
+    const surface = side === 'left' ? this.bookRig.leftPageSurface : this.bookRig.rightPageSurface;
+    const mat = surface.material as THREE.MeshStandardMaterial;
+
     const step = () => {
       if (this.disposed || this.isDocumentHidden || this.activePreviewSide !== side) return;
       const elapsedSec = (performance.now() - this.previewStartMs) / 1000;
       const handle = this.pageHandles.get(this.getSlotKey(this.state.currentSpread, side));
       if (handle) {
-        handle.render(elapsedSec, true);
+        const liveTex = handle.renderLiveFrame(elapsedSec, true);
+        if (mat.map !== liveTex) {
+          mat.map = liveTex;
+          mat.needsUpdate = true;
+        }
         this.requestRender();
       }
-      const interval = this.isSoftwareGl ? 180 : 42;
+      const interval = this.isSoftwareGl ? 200 : 62;
       this.previewAnimId = window.setTimeout(() => {
         if (!this.disposed) step();
       }, interval);
@@ -735,6 +1023,9 @@ export class BookSceneController {
     if (this.previewAnimId) {
       clearTimeout(this.previewAnimId);
       this.previewAnimId = 0;
+    }
+    if (this.activePreviewSide) {
+      this.restoreStaticPageTexture(this.activePreviewSide);
     }
     this.activePreviewSide = null;
   }
@@ -749,13 +1040,248 @@ export class BookSceneController {
     this.setActiveHoverProject(slot.project, side);
   }
 
+  private handleDragPointerMove(e: PointerEvent) {
+    const drag = this.dragState;
+    if (!drag || this.disposed) return;
+
+    const now = performance.now();
+    const dt = Math.max(8, now - drag.lastTimeMs);
+    const instantV = (e.clientX - drag.lastX) / dt;
+    drag.velocityPxPerMs = drag.velocityPxPerMs * 0.65 + instantV * 0.35;
+    drag.lastX = e.clientX;
+    drag.lastTimeMs = now;
+
+    const dx = e.clientX - drag.startX;
+    const dy = e.clientY - drag.startY;
+
+    if (!drag.active) {
+      if (Math.hypot(dx, dy) < 14) return;
+      if (Math.abs(dx) < Math.abs(dy) * 0.65) {
+        this.dragState = null;
+        return;
+      }
+
+      const direction: 'next' | 'prev' = dx < 0 ? 'next' : 'prev';
+      const isMobile = this.getViewportTier() === 'mobile';
+      const startRes = beginDragTurn(this.state, direction, isMobile);
+
+      if (startRes.sameSpreadMobileSide) {
+        this.suppressNextClick = true;
+        this.dragState = null;
+        this.setMobileSide(startRes.sameSpreadMobileSide);
+        return;
+      }
+
+      if (!startRes.startedSheetDrag) {
+        this.dragState = null;
+        return;
+      }
+
+      this.clearHoverState();
+      this.dragTween?.kill();
+      this.state = startRes.nextState;
+      this.callbacks.onStateChange({ ...this.state });
+      this.preloadAdjacentSpreads(startRes.toSpread);
+
+      const prevLeftH = this.getOrCreatePageHandle(startRes.fromSpread, 'left');
+      const prevRightH = this.getOrCreatePageHandle(startRes.fromSpread, 'right');
+      const nextLeftH = this.getOrCreatePageHandle(startRes.toSpread, 'left');
+      const nextRightH = this.getOrCreatePageHandle(startRes.toSpread, 'right');
+
+      const slot = this.bookRig.turningSheets[0];
+      if (!slot) {
+        this.state = finishDragTurn(this.state, false);
+        this.callbacks.onStateChange({ ...this.state });
+        this.dragState = null;
+        return;
+      }
+
+      if (direction === 'next') {
+        this.bookRig.setSpreadTextures(prevLeftH.texture, nextRightH.texture);
+        slot.frontMaterial.map = prevRightH.texture;
+        slot.backMaterial.map = nextLeftH.texture;
+        slot.progress = 0;
+      } else {
+        this.bookRig.setSpreadTextures(nextLeftH.texture, prevRightH.texture);
+        slot.frontMaterial.map = nextRightH.texture;
+        slot.backMaterial.map = prevLeftH.texture;
+        slot.progress = 1;
+      }
+      slot.frontMaterial.needsUpdate = true;
+      slot.backMaterial.needsUpdate = true;
+      slot.mesh.visible = true;
+
+      try {
+        this.renderer.domElement.setPointerCapture(e.pointerId);
+      } catch {
+        // Ignore if pointer capture is unavailable
+      }
+
+      drag.active = true;
+      drag.direction = direction;
+      drag.fromSpread = startRes.fromSpread;
+      drag.toSpread = startRes.toSpread;
+      drag.lastStepMs = now;
+      this.setCursorInteractive(true);
+
+      const dragSpanPx = Math.max(320, Math.min(620, window.innerWidth * 0.42));
+      const initialRaw =
+        direction === 'next' ? -dx / dragSpanPx : 1 - dx / dragSpanPx;
+      drag.targetProgress = Math.max(0.001, Math.min(0.999, initialRaw));
+      drag.currentProgress =
+        direction === 'next'
+          ? Math.max(0.018, Math.min(0.18, drag.targetProgress))
+          : Math.min(0.982, Math.max(0.82, drag.targetProgress));
+      this.applyDragTurnVisuals(drag.fromSpread, drag.toSpread, drag.direction, drag.currentProgress);
+      this.ensureDragSmoothingLoop();
+      return;
+    }
+
+    if (drag.active && drag.direction) {
+      const dragSpanPx = Math.max(320, Math.min(620, window.innerWidth * 0.42));
+      const raw =
+        drag.direction === 'next'
+          ? -dx / dragSpanPx
+          : 1 - dx / dragSpanPx;
+      drag.targetProgress = Math.max(0.001, Math.min(0.999, raw));
+      this.ensureDragSmoothingLoop();
+    }
+  }
+
+  private updateDragTurnMesh(
+    fromSpread: number,
+    toSpread: number,
+    direction: 'next' | 'prev',
+    progress: number,
+  ) {
+    const slot = this.bookRig.turningSheets[0];
+    if (!slot) return;
+    const blend = direction === 'next' ? progress : 1 - progress;
+    const spreadPos = fromSpread + (toSpread - fromSpread) * blend;
+    this.bookRig.setStackHeights(spreadPos, PHYSICAL_SPREAD_COUNT, 1);
+    slot.leftStackY = this.bookRig.leftPageSurface.position.y + 0.0028;
+    slot.rightStackY = this.bookRig.rightPageSurface.position.y + 0.0028;
+    slot.progress = progress;
+    this.bookRig.updateTurningSheetGeometry(0);
+  }
+
+  private applyDragTurnVisuals(
+    fromSpread: number,
+    toSpread: number,
+    direction: 'next' | 'prev',
+    progress: number,
+  ) {
+    this.updateDragTurnMesh(fromSpread, toSpread, direction, progress);
+    this.requestRender();
+  }
+
+  private stepActiveDragSmoothing() {
+    const drag = this.dragState;
+    if (!drag || !drag.active || !drag.direction) return false;
+    const now = performance.now();
+    const dtSec = Math.min(0.12, Math.max(0.004, (now - drag.lastStepMs) / 1000));
+    drag.lastStepMs = now;
+    const diff = drag.targetProgress - drag.currentProgress;
+    if (Math.abs(diff) <= 0.0015) {
+      if (drag.currentProgress !== drag.targetProgress) {
+        drag.currentProgress = drag.targetProgress;
+        this.updateDragTurnMesh(drag.fromSpread, drag.toSpread, drag.direction, drag.currentProgress);
+      }
+      return false;
+    }
+    const alpha = 1 - Math.exp(-16 * dtSec);
+    drag.currentProgress += diff * alpha;
+    this.updateDragTurnMesh(drag.fromSpread, drag.toSpread, drag.direction, drag.currentProgress);
+    return Math.abs(drag.targetProgress - drag.currentProgress) > 0.0015;
+  }
+
+  private ensureDragSmoothingLoop() {
+    if (this.dragTickId || this.disposed || !this.dragState?.active) return;
+    const step = () => {
+      this.dragTickId = 0;
+      const drag = this.dragState;
+      if (this.disposed || !drag || !drag.active || !drag.direction) return;
+
+      const needsMore = this.stepActiveDragSmoothing();
+      this.requestRender();
+
+      if (needsMore) {
+        this.dragTickId = window.setTimeout(step, this.isSoftwareGl ? 24 : 16);
+      }
+    };
+    this.dragTickId = window.setTimeout(step, 16);
+  }
+
+  private finishDragGesture(e: PointerEvent) {
+    const drag = this.dragState;
+    this.dragState = null;
+    clearTimeout(this.dragTickId);
+    this.dragTickId = 0;
+
+    if (!drag) return;
+    try {
+      if (this.renderer.domElement.hasPointerCapture(e.pointerId)) {
+        this.renderer.domElement.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // Ignore if pointer capture is already released
+    }
+
+    if (!drag.active || !drag.direction) return;
+
+    this.setCursorInteractive(false);
+    this.suppressNextClick = true;
+    window.setTimeout(() => {
+      this.suppressNextClick = false;
+    }, 60);
+
+    const releaseAgeMs = performance.now() - drag.lastTimeMs;
+    const releaseVelocity = releaseAgeMs > 120 ? 0 : drag.velocityPxPerMs;
+    const { committed, endProgress } = resolveDragRelease({
+      direction: drag.direction,
+      progress: drag.currentProgress,
+      velocityPxPerMs: releaseVelocity,
+    });
+
+    const slot = this.bookRig.turningSheets[0];
+    if (!slot) {
+      this.state = finishDragTurn(this.state, committed);
+      this.callbacks.onStateChange({ ...this.state });
+      return;
+    }
+
+    const proxy = { progress: drag.currentProgress };
+    const remaining = Math.abs(endProgress - drag.currentProgress);
+    const durationSec = this.reducedMotion ? 0.08 : Math.max(0.24, Math.min(0.56, remaining * 0.62));
+
+    this.dragTween?.kill();
+    this.dragTween = gsap.to(proxy, {
+      progress: endProgress,
+      duration: durationSec,
+      ease: 'power2.out',
+      onUpdate: () => {
+        this.applyDragTurnVisuals(drag.fromSpread, drag.toSpread, drag.direction!, proxy.progress);
+      },
+      onComplete: () => {
+        slot.mesh.visible = false;
+        this.state = finishDragTurn(this.state, committed);
+        const settledLeft = this.getOrCreatePageHandle(this.state.currentSpread, 'left');
+        const settledRight = this.getOrCreatePageHandle(this.state.currentSpread, 'right');
+        this.bookRig.setSpreadTextures(settledLeft.texture, settledRight.texture);
+        this.bookRig.setStackHeights(this.state.currentSpread, PHYSICAL_SPREAD_COUNT, 1);
+        this.callbacks.onStateChange({ ...this.state });
+        this.requestRender();
+      },
+    });
+  }
+
   private handleCanvasClick(e: MouseEvent) {
-    if (this.disposed) return;
+    if (this.disposed || this.suppressNextClick) return;
     this.updateNdcFromClient(e.clientX, e.clientY);
     this.raycaster.setFromCamera(this.pointerNdc, this.camera);
 
     if (this.state.phase === 'closed') {
-      const hits = this.raycaster.intersectObject(this.bookRig.frontCoverMesh, false);
+      const hits = this.raycaster.intersectObject(this.bookRig.group, true);
       if (hits.length > 0) {
         this.openBook();
       }
@@ -813,6 +1339,7 @@ export class BookSceneController {
     this.state = beginOpen(this.state);
     this.callbacks.onStateChange({ ...this.state });
 
+    this.syncPageSupersampling();
     this.preloadAdjacentSpreads(0);
     const leftH = this.getOrCreatePageHandle(0, 'left');
     const rightH = this.getOrCreatePageHandle(0, 'right');
@@ -828,10 +1355,12 @@ export class BookSceneController {
       onUpdate: () => {
         this.bookRig.setOpenProgress(this.animProxy.openProgress);
         this.bookRig.setStackHeights(0, PHYSICAL_SPREAD_COUNT, this.animProxy.openProgress);
+        this.applyPhaseLighting(this.animProxy.openProgress);
         this.applyCameraFromProxy();
         this.requestRender();
       },
       onComplete: () => {
+        this.applyPhaseLighting(1);
         this.state = finishOpen(this.state);
         this.callbacks.onStateChange({ ...this.state });
         this.requestRender();
@@ -859,6 +1388,7 @@ export class BookSceneController {
 
   public closeBook() {
     if (this.state.phase !== 'open') return;
+    this.dragTween?.kill();
     this.clearHoverState();
     const startingSpread = this.state.currentSpread;
     this.state = beginClose(this.state);
@@ -881,7 +1411,9 @@ export class BookSceneController {
         this.bookRig.setSpreadTextures(leftH.texture, rightH.texture);
         this.bookRig.setOpenProgress(0);
         this.bookRig.setStackHeights(0, PHYSICAL_SPREAD_COUNT, 0);
+        this.applyPhaseLighting(0);
         this.state = finishClose(this.state);
+        this.syncPageSupersampling();
         this.callbacks.onStateChange({ ...this.state });
         this.requestRender();
       },
@@ -1018,6 +1550,7 @@ export class BookSceneController {
         onUpdate: () => {
           this.bookRig.setOpenProgress(this.animProxy.openProgress);
           this.bookRig.setStackHeights(0, PHYSICAL_SPREAD_COUNT, this.animProxy.openProgress);
+          this.applyPhaseLighting(this.animProxy.openProgress);
           this.requestRender();
         },
       },
@@ -1078,6 +1611,7 @@ export class BookSceneController {
       return;
     }
 
+    this.dragTween?.kill();
     this.clearHoverState();
     this.preloadAdjacentSpreads(targetSpread);
 
@@ -1264,6 +1798,10 @@ export class BookSceneController {
     this.frameId = requestAnimationFrame(() => {
       if (this.disposed) return;
       this.renderDirty = false;
+      if (this.dragState?.active && this.stepActiveDragSmoothing()) {
+        this.renderDirty = true;
+      }
+      this.updateBookShaderBounds();
       if (this.composer) {
         this.composer.render();
       } else {
@@ -1286,9 +1824,11 @@ export class BookSceneController {
   public dispose() {
     this.disposed = true;
     this.hoverTween?.kill();
+    this.dragTween?.kill();
     this.activeTimeline?.kill();
     this.stopPreviewLoop();
     clearTimeout(this.parallaxAnimId);
+    clearTimeout(this.dragTickId);
     cancelAnimationFrame(this.frameId);
     clearTimeout(this.frameId);
 

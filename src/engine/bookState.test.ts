@@ -2,16 +2,23 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   beginClose,
+  beginDragTurn,
   beginOpen,
   computeCursorCameraOffset,
+  computeLampShadowOffset,
+  computePageSupersampleScale,
+  computePhaseLighting,
   computeTurnPlan,
   createInitialBookState,
   deformPageVertex,
   finishClose,
+  finishDragTurn,
   finishOpen,
   finishTurn,
   getStepTarget,
   requestSpreadNavigation,
+  resolveDragRelease,
+  worldOffsetToLocal,
 } from './bookState';
 
 test('book open and close lifecycle transitions cleanly without overlapping', () => {
@@ -179,4 +186,128 @@ test('computeCursorCameraOffset clamps extreme NDC coordinates cleanly', () => {
   const nanSafe = computeCursorCameraOffset(Number.NaN, 0.5, 0.05, 0.02);
   assert.equal(nanSafe.yawRad, 0);
   assert.equal(nanSafe.pitchRad, 0.01);
+});
+
+test('drag-to-flip commits on threshold or flick velocity, springs back on shallow release, and respects bounds', () => {
+  const openState = createInitialBookState(4, true, 10);
+
+  // Cannot drag prev at spread 0 on desktop
+  const blockedPrev = beginDragTurn(openState, 'prev', false);
+  assert.equal(blockedPrev.startedSheetDrag, false);
+
+  // Dragging next from spread 0 -> 1
+  const started = beginDragTurn(openState, 'next', false);
+  assert.equal(started.startedSheetDrag, true);
+  assert.equal(started.fromSpread, 0);
+  assert.equal(started.toSpread, 1);
+  assert.equal(started.nextState.phase, 'turning');
+
+  // Shallow or weak-flick drag springs back (requires holding and dragging farther)
+  const cancelShallow = resolveDragRelease({ direction: 'next', progress: 0.38, velocityPxPerMs: -0.05 });
+  assert.deepEqual(cancelShallow, { committed: false, endProgress: 0 });
+  const cancelTooShortFlick = resolveDragRelease({ direction: 'next', progress: 0.14, velocityPxPerMs: -1.1 });
+  assert.deepEqual(cancelTooShortFlick, { committed: false, endProgress: 0 });
+  const reverted = finishDragTurn(started.nextState, false);
+  assert.equal(reverted.phase, 'open');
+  assert.equal(reverted.currentSpread, 0);
+
+  // Deliberate drag past 0.52 or strong flick past minFlickProgress commits
+  const commitDrag = resolveDragRelease({ direction: 'next', progress: 0.55, velocityPxPerMs: -0.04 });
+  assert.deepEqual(commitDrag, { committed: true, endProgress: 1 });
+  const flickNext = resolveDragRelease({ direction: 'next', progress: 0.28, velocityPxPerMs: -1.1 });
+  assert.deepEqual(flickNext, { committed: true, endProgress: 1 });
+  const committed = finishDragTurn(started.nextState, true);
+  assert.equal(committed.phase, 'open');
+  assert.equal(committed.currentSpread, 1);
+
+  // Prev drag release checks
+  const commitPrev = resolveDragRelease({ direction: 'prev', progress: 0.42, velocityPxPerMs: 0.05 });
+  assert.deepEqual(commitPrev, { committed: true, endProgress: 0 });
+  const cancelPrev = resolveDragRelease({ direction: 'prev', progress: 0.65, velocityPxPerMs: 0.15 });
+  assert.deepEqual(cancelPrev, { committed: false, endProgress: 1 });
+});
+
+test('computePhaseLighting dynamically scales lamp and ambient lighting with openProgress', () => {
+  const base = {
+    spotIntensity: 38,
+    spotAngle: Math.PI / 2.05,
+    spotPenumbra: 0.92,
+    keyIntensity: 0.94,
+    keyPosition: { x: -0.85, y: 3.3, z: 0.85 },
+    hemiIntensity: 0.16,
+    rimIntensity: 0.5,
+  };
+  const closed = computePhaseLighting(0, base);
+  const half = computePhaseLighting(0.5, base);
+  const open = computePhaseLighting(1, base);
+
+  assert.ok(open.spotIntensity > half.spotIntensity && half.spotIntensity > closed.spotIntensity);
+  assert.ok(open.keyIntensity > closed.keyIntensity);
+  assert.ok(open.spotAngle > closed.spotAngle);
+  assert.ok(open.hemiIntensity < closed.hemiIntensity);
+  assert.ok(open.environmentIntensity > closed.environmentIntensity);
+});
+
+test('computePageSupersampleScale scales dynamically between closed and open reading views', () => {
+  const closedGpu = computePageSupersampleScale({
+    phase: 'closed',
+    viewportWidth: 1440,
+    dpr: 2,
+    isSoftwareGl: false,
+    maxTextureSize: 8192,
+  });
+  const openGpu = computePageSupersampleScale({
+    phase: 'open',
+    viewportWidth: 1440,
+    dpr: 2,
+    isSoftwareGl: false,
+    maxTextureSize: 8192,
+  });
+  const openLowTex = computePageSupersampleScale({
+    phase: 'open',
+    viewportWidth: 1440,
+    dpr: 2,
+    isSoftwareGl: false,
+    maxTextureSize: 2048,
+  });
+  const openSoftware = computePageSupersampleScale({
+    phase: 'open',
+    viewportWidth: 1440,
+    dpr: 1,
+    isSoftwareGl: true,
+    maxTextureSize: 4096,
+  });
+
+  assert.equal(closedGpu, 1.25);
+  assert.equal(openGpu, 2.0);
+  assert.ok(openLowTex <= 2048 / 1920 + 1e-5);
+  assert.equal(openSoftware, 1.5);
+});
+
+test('computeLampShadowOffset projects prop drop shadows away from lamp angle cleanly', () => {
+  // Plant at (-1.72, -0.08) illuminated by lamp at (-0.42, 3.35, 0.52) casts toward -X, -Z
+  const plantOff = computeLampShadowOffset({
+    propX: -1.72,
+    propZ: -0.08,
+    lampX: -0.42,
+    lampY: 3.35,
+    lampZ: 0.52,
+    castHeight: 0.2,
+  });
+  assert.ok(plantOff.worldDx < 0 && plantOff.worldDz < 0);
+
+  // Coffee at (+1.72, -0.06) casts toward +X, -Z
+  const coffeeOff = computeLampShadowOffset({
+    propX: 1.72,
+    propZ: -0.06,
+    lampX: -0.42,
+    lampY: 3.35,
+    lampZ: 0.52,
+    castHeight: 0.14,
+  });
+  assert.ok(coffeeOff.worldDx > 0 && coffeeOff.worldDz < 0);
+
+  // World-to-local rotation reverses when rotated back by +rotationY
+  const local = worldOffsetToLocal(0.06, -0.02, 0.42, 0.9);
+  assert.ok(Number.isFinite(local.localDx) && Number.isFinite(local.localDz));
 });

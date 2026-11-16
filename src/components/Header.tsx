@@ -12,22 +12,10 @@ export function Header({ config, onOpenContact, onResetToStart }: HeaderProps) {
       <button
         type="button"
         onClick={onResetToStart}
-        className="pointer-events-auto inline-flex min-h-[44px] items-center gap-2.5 rounded-sm px-1.5 py-1 text-left text-[#f5f2eb] transition-opacity hover:opacity-80"
+        className="pointer-events-auto inline-flex min-h-[44px] items-center rounded-sm px-1.5 py-1 text-left text-[#f5f2eb] transition-opacity hover:opacity-80"
         aria-label={`${config.brandName} portfolio home`}
       >
-        <svg
-          width="22"
-          height="22"
-          viewBox="0 0 24 24"
-          fill="none"
-          aria-hidden="true"
-          className="shrink-0"
-        >
-          <circle cx="12" cy="12" r="10" fill="#f5f2eb" />
-          <circle cx="12" cy="12" r="4.2" fill="#0b0a09" />
-          <circle cx="14.4" cy="10.8" r="1.8" fill="#f5f2eb" />
-        </svg>
-        <span className="text-[17px] font-semibold tracking-tight whitespace-nowrap">
+        <span className="text-[19px] font-semibold tracking-tight whitespace-nowrap">
           {config.brandName}
         </span>
       </button>

@@ -250,38 +250,53 @@ export function createBookRig(
   // Inside front cover flyleaf/Contents mesh attached inside frontCoverPivot so it folds cleanly with cover
   const insideCoverGeo = pageSurfaceGeo.clone();
   insideCoverGeo.rotateZ(Math.PI);
-  const insideCoverMat = new THREE.MeshStandardMaterial({
+  const insideCoverMat = new THREE.MeshPhysicalMaterial({
     color: 0xffffff,
-    roughness: theme.materials.paperRoughness,
+    roughness: 0.62,
     metalness: 0.0,
-    envMapIntensity: 0.15,
+    clearcoat: 0.12,
+    clearcoatRoughness: 0.45,
+    reflectivity: 0.42,
+    ior: 1.46,
+    specularIntensity: 0.24,
+    envMapIntensity: 0.14,
     polygonOffset: true,
     polygonOffsetFactor: -1,
     polygonOffsetUnits: -1,
   });
   enhancePaperShader(insideCoverMat, 'left');
   const insideCoverSurface = new THREE.Mesh(insideCoverGeo, insideCoverMat);
-  insideCoverSurface.position.set(pageWidth / 2, -coverThickness / 2 - 0.0012, 0);
+  insideCoverSurface.position.set(pageWidth / 2, -coverThickness / 2 - 0.0014, 0);
   insideCoverSurface.receiveShadow = true;
   insideCoverSurface.name = 'book-inside-cover';
   frontCoverPivot.add(insideCoverSurface);
 
-  const leftPageMat = new THREE.MeshStandardMaterial({
+  const leftPageMat = new THREE.MeshPhysicalMaterial({
     color: 0xffffff,
     roughness: theme.materials.paperRoughness,
     metalness: 0.0,
-    envMapIntensity: 0.15,
+    clearcoat: 0.34,
+    clearcoatRoughness: 0.24,
+    reflectivity: 0.56,
+    ior: 1.5,
+    specularIntensity: 0.44,
+    envMapIntensity: 0.2,
     polygonOffset: true,
     polygonOffsetFactor: -1,
     polygonOffsetUnits: -1,
   });
   enhancePaperShader(leftPageMat, 'left');
 
-  const rightPageMat = new THREE.MeshStandardMaterial({
+  const rightPageMat = new THREE.MeshPhysicalMaterial({
     color: 0xffffff,
     roughness: theme.materials.paperRoughness,
     metalness: 0.0,
-    envMapIntensity: 0.15,
+    clearcoat: 0.34,
+    clearcoatRoughness: 0.24,
+    reflectivity: 0.56,
+    ior: 1.5,
+    specularIntensity: 0.44,
+    envMapIntensity: 0.2,
     polygonOffset: true,
     polygonOffsetFactor: -1,
     polygonOffsetUnits: -1,
@@ -300,23 +315,33 @@ export function createBookRig(
   rightPageSurface.name = 'book-right-page';
   group.add(rightPageSurface);
 
-  // Pool of deforming turning sheets
+  // Pool of deforming turning sheets (glossy coated stock catching specular arcs mid-curl)
   const turningSheets: TurningSheetSlot[] = [];
   for (let i = 0; i < maxTurningSheets; i++) {
     const geom = createDualSidedSheetGeometry(pageWidth, pageHeight, 40, 20);
-    const frontMat = new THREE.MeshStandardMaterial({
+    const frontMat = new THREE.MeshPhysicalMaterial({
       color: 0xffffff,
       roughness: theme.materials.paperRoughness,
       metalness: 0.0,
-      envMapIntensity: 0.15,
+      clearcoat: 0.72,
+      clearcoatRoughness: 0.16,
+      reflectivity: 0.68,
+      ior: 1.52,
+      specularIntensity: 0.78,
+      envMapIntensity: 0.46,
       side: THREE.FrontSide,
     });
     enhancePaperShader(frontMat, 'sheet');
-    const backMat = new THREE.MeshStandardMaterial({
+    const backMat = new THREE.MeshPhysicalMaterial({
       color: 0xffffff,
       roughness: theme.materials.paperRoughness,
       metalness: 0.0,
-      envMapIntensity: 0.15,
+      clearcoat: 0.72,
+      clearcoatRoughness: 0.16,
+      reflectivity: 0.68,
+      ior: 1.52,
+      specularIntensity: 0.78,
+      envMapIntensity: 0.46,
       side: THREE.FrontSide,
     });
     enhancePaperShader(backMat, 'sheet');

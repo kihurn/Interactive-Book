@@ -40,9 +40,13 @@ export interface BookStaticTextureSet {
 }
 
 export interface PageTextureHandle {
-  texture: THREE.CanvasTexture;
-  canvas: HTMLCanvasElement;
+  readonly texture: THREE.CanvasTexture;
+  readonly liveTexture: THREE.CanvasTexture;
+  readonly canvas: HTMLCanvasElement;
+  readonly supersampleScale: number;
+  setSupersampleScale: (scale: number) => boolean;
   render: (timeSec: number, hovered: boolean, hoveredProjectId?: string | null) => void;
+  renderLiveFrame: (timeSec: number, hovered: boolean) => THREE.CanvasTexture;
   contentsHitboxes: ContentsHitbox[];
   dispose: () => void;
 }
@@ -61,15 +65,43 @@ function fbm1D(x: number): number {
   );
 }
 
+function valueNoise2D(x: number, y: number): number {
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  const fx = x - ix;
+  const fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx);
+  const uy = fy * fy * (3 - 2 * fy);
+
+  const a = seededNoise(ix, iy);
+  const b = seededNoise(ix + 1, iy);
+  const c = seededNoise(ix, iy + 1);
+  const d = seededNoise(ix + 1, iy + 1);
+
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+
+function fbmWood2D(x: number, y: number): number {
+  let sum = 0;
+  let amp = 0.56;
+  let freq = 1.0;
+  for (let i = 0; i < 3; i++) {
+    sum += valueNoise2D(x * freq, y * freq) * amp;
+    freq *= 2.08;
+    amp *= 0.46;
+  }
+  return sum;
+}
+
 /**
- * Procedurally generates desk-basecolor, desk-normal, and desk-roughness maps
- * for the lamplit dark wood desk without external image dependencies.
+ * Procedurally generates smooth organic dark-oak desk-basecolor, desk-normal, and desk-roughness maps
+ * free of uncorrelated pixel noise so lamplight glides across matte-oiled wood fibers.
  */
 export function createDeskTextures(
   theme: SceneTheme,
   maxAnisotropy: number,
 ): DeskTextureSet {
-  const size = 1536;
+  const size = 1024;
   const colorCanvas = document.createElement('canvas');
   colorCanvas.width = size;
   colorCanvas.height = size;
@@ -95,38 +127,45 @@ export function createDeskTextures(
   const darkColor = new THREE.Color(theme.palette.deskGrainDark);
   const hiColor = new THREE.Color(theme.palette.deskGrainHighlight);
 
-  const plankHeight = size / 5;
+  const plankCount = 4;
+  const plankHeight = size / plankCount;
 
   for (let y = 0; y < size; y++) {
     const plankIdx = Math.floor(y / plankHeight);
     const localY = (y % plankHeight) / plankHeight;
-    const plankSeam = localY < 0.009 || localY > 0.991 ? 1 : 0;
-    const plankShift = seededNoise(plankIdx, 7.3) * 40;
+    // Chamfered non-conjoined plank bevel (6.5px) + recessed dark shadow gap crevice (2.2px)
+    const seamEdgeDist = Math.min(localY, 1 - localY) * plankHeight;
+    const seamBevel = Math.max(0, 1 - seamEdgeDist / 6.5);
+    const crevice = Math.max(0, 1 - seamEdgeDist / 2.2);
+    const plankTone = 0.8 + seededNoise(plankIdx, 13.7) * 0.26;
+    const plankShiftX = seededNoise(plankIdx, 7.3) * 29.0;
+    const plankShiftY = seededNoise(plankIdx, 19.1) * 17.0;
 
     for (let x = 0; x < size; x++) {
       const idx = y * size + x;
       const nx = x / size;
       const ny = y / size;
 
-      // Fine linear oak wood fibers along X without wavy ripples
-      const warp = fbm1D(nx * 3.8 + plankShift) * 6.5;
-      const ringCoord = (y + warp) * 0.11 + plankIdx * 17.3;
-      const grain = 0.5 + 0.5 * Math.sin(ringCoord + fbm1D(nx * 9.0 + ny * 1.8) * 0.9);
-      const fineStreak = seededNoise(Math.floor(x * 0.12), y) * 0.28;
-      const pore = seededNoise(x, Math.floor(y * 0.85)) * 0.08;
+      // Smooth elongated oak cathedral & straight fibers along X (tileable in X via sin/cos blend)
+      const angleX = nx * Math.PI * 2;
+      const gx = Math.cos(angleX) * 1.4 + Math.sin(angleX) * 1.4 + nx * 3.2 + plankShiftX;
+      const gy = ny * 18.0 + plankShiftY;
 
-      const t = Math.max(0, Math.min(1, grain * 0.38 + fineStreak + pore));
-      const h = (t - plankSeam * 0.35) * 0.55 + fineStreak * 0.3;
+      const lowWarp = (fbmWood2D(gx * 0.65, gy * 0.35) - 0.5) * 4.2;
+      const rings = 0.5 + 0.5 * Math.sin((ny * 26.0 + lowWarp + plankIdx * 3.7) * Math.PI);
+      // Long smooth oak vessel fibers & silky medullary rays (zero raw white noise!)
+      const fiberStreak = fbmWood2D(nx * 14.0 + plankShiftX, ny * 96.0 + plankShiftY);
+      const oakPoreField = fbmWood2D(nx * 24.0 + plankShiftX * 0.5, ny * 190.0 + plankShiftY);
+      const poreGroove = Math.max(0, 1 - Math.abs(oakPoreField - 0.48) * 11.5) * 0.24;
+
+      const t = Math.max(0, Math.min(1, rings * 0.34 + fiberStreak * 0.52 - poreGroove * 0.65));
+      const h = t * 0.48 - poreGroove * 0.32 - seamBevel * 1.15 - crevice * 1.45;
       heightField[idx] = h;
 
       let r: number;
       let g: number;
       let b: number;
-      if (plankSeam > 0) {
-        r = darkColor.r * 0.6;
-        g = darkColor.g * 0.6;
-        b = darkColor.b * 0.6;
-      } else if (t < 0.5) {
+      if (t < 0.5) {
         const k = t * 2;
         r = darkColor.r * (1 - k) + baseColor.r * k;
         g = darkColor.g * (1 - k) + baseColor.g * k;
@@ -138,13 +177,21 @@ export function createDeskTextures(
         b = baseColor.b * (1 - k) + hiColor.b * k;
       }
 
+      const seamDarken = Math.max(0.08, 1 - seamBevel * 0.62 - crevice * 0.34);
+      const poreDarken = 1 - poreGroove * 0.42;
+      const toneMul = plankTone * seamDarken * poreDarken;
+
       const p4 = idx * 4;
-      cImg.data[p4] = Math.round(Math.min(1, r) * 255);
-      cImg.data[p4 + 1] = Math.round(Math.min(1, g) * 255);
-      cImg.data[p4 + 2] = Math.round(Math.min(1, b) * 255);
+      cImg.data[p4] = Math.round(Math.min(1, r * toneMul) * 255);
+      cImg.data[p4 + 1] = Math.round(Math.min(1, g * toneMul) * 255);
+      cImg.data[p4 + 2] = Math.round(Math.min(1, b * toneMul) * 255);
       cImg.data[p4 + 3] = 255;
 
-      const roughVal = Math.round((0.58 + (1 - t) * 0.28 + plankSeam * 0.12) * 255);
+      // Hand-oiled dark oak roughness: satin-matte fibers (0.74..0.88) and deep matte recessed plank seams (0.98)
+      const roughVal = Math.round(
+        Math.min(1, 0.74 + (1 - t) * 0.16 + poreGroove * 0.3 + seamBevel * 0.24 + crevice * 0.12) *
+          255,
+      );
       rImg.data[p4] = roughVal;
       rImg.data[p4 + 1] = roughVal;
       rImg.data[p4 + 2] = roughVal;
@@ -152,7 +199,8 @@ export function createDeskTextures(
     }
   }
 
-  const strength = 0.95;
+  // Soft 3x3-filtered normal derivation for strong plank separation depth without grain noise
+  const strength = 0.56;
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
       const xm = (x - 1 + size) % size;
@@ -160,8 +208,13 @@ export function createDeskTextures(
       const ym = (y - 1 + size) % size;
       const yp = (y + 1) % size;
 
-      const dx = (heightField[y * size + xp] - heightField[y * size + xm]) * strength;
-      const dy = (heightField[yp * size + x] - heightField[ym * size + x]) * strength;
+      const hL = (heightField[ym * size + xm] + heightField[y * size + xm] * 2 + heightField[yp * size + xm]) * 0.25;
+      const hR = (heightField[ym * size + xp] + heightField[y * size + xp] * 2 + heightField[yp * size + xp]) * 0.25;
+      const hD = (heightField[ym * size + xm] + heightField[ym * size + x] * 2 + heightField[ym * size + xp]) * 0.25;
+      const hU = (heightField[yp * size + xm] + heightField[yp * size + x] * 2 + heightField[yp * size + xp]) * 0.25;
+
+      const dx = (hR - hL) * strength;
+      const dy = (hU - hD) * strength;
 
       const nx = -dx;
       const ny = -dy;
@@ -184,19 +237,19 @@ export function createDeskTextures(
   baseColorTex.colorSpace = THREE.SRGBColorSpace;
   baseColorTex.wrapS = THREE.RepeatWrapping;
   baseColorTex.wrapT = THREE.RepeatWrapping;
-  baseColorTex.repeat.set(4.8, 3.6);
+  baseColorTex.repeat.set(3.4, 4.4);
   baseColorTex.anisotropy = maxAnisotropy;
 
   const normalTex = new THREE.CanvasTexture(normalCanvas);
   normalTex.wrapS = THREE.RepeatWrapping;
   normalTex.wrapT = THREE.RepeatWrapping;
-  normalTex.repeat.set(4.8, 3.6);
+  normalTex.repeat.set(3.4, 4.4);
   normalTex.anisotropy = maxAnisotropy;
 
   const roughnessTex = new THREE.CanvasTexture(roughCanvas);
   roughnessTex.wrapS = THREE.RepeatWrapping;
   roughnessTex.wrapT = THREE.RepeatWrapping;
-  roughnessTex.repeat.set(4.8, 3.6);
+  roughnessTex.repeat.set(3.4, 4.4);
   roughnessTex.anisotropy = maxAnisotropy;
 
   return {
@@ -218,34 +271,15 @@ function drawBrandMark(
   scale: number,
   color: string,
   brandName: string,
+  align: CanvasTextAlign = 'center',
 ) {
   ctx.save();
   ctx.translate(cx, cy);
-  ctx.fillStyle = color;
-  ctx.strokeStyle = color;
-
-  // Minimalist concentric editorial aperture emblem (geometric book-leaf icon)
-  const r = 13 * scale;
-  ctx.beginPath();
-  ctx.arc(-26 * scale, 0, r, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.fillStyle = '#1b1b1f';
-  ctx.beginPath();
-  ctx.arc(-26 * scale, 0, r * 0.42, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.fillStyle = color;
-  ctx.beginPath();
-  ctx.arc(-26 * scale + r * 0.25, -r * 0.12, r * 0.18, 0, Math.PI * 2);
-  ctx.fill();
-
-  // Crisp sans-serif wordmark
-  ctx.font = `600 ${Math.round(23 * scale)}px "Plus Jakarta Sans", -apple-system, sans-serif`;
-  ctx.textAlign = 'left';
+  ctx.font = `600 ${Math.round(25 * scale)}px "Plus Jakarta Sans", -apple-system, sans-serif`;
+  ctx.textAlign = align;
   ctx.textBaseline = 'middle';
   ctx.fillStyle = color;
-  ctx.fillText(brandName, -5 * scale, 1 * scale);
+  ctx.fillText(brandName, 0, 0);
   ctx.restore();
 }
 
@@ -291,8 +325,8 @@ export function createBookStaticTextures(
   fcCtx.fillStyle = creaseGrad;
   fcCtx.fillRect(0, 0, 64, 1080);
 
-  // Centered brand mark on cover
-  drawBrandMark(fcCtx, 940, 540, 2.05, theme.palette.coverMark, brandName);
+  // Centered typographic wordmark on cover (no logo icon)
+  drawBrandMark(fcCtx, 960, 540, 2.25, theme.palette.coverMark, brandName, 'center');
 
   const frontCoverMap = new THREE.CanvasTexture(fcCanvas);
   frontCoverMap.colorSpace = THREE.SRGBColorSpace;
@@ -440,16 +474,19 @@ export function createBookStaticTextures(
   coffeeLatteMap.colorSpace = THREE.SRGBColorSpace;
   coffeeLatteMap.anisotropy = maxAnisotropy;
 
-  // 7. Business card texture (1024x576 crisp charcoal stock)
+  // 7. Business card texture (1024x576 warm charcoal cotton stock with subtle border highlight)
   const bcCardCanvas = document.createElement('canvas');
   bcCardCanvas.width = 1024;
   bcCardCanvas.height = 576;
   const cardCtx = bcCardCanvas.getContext('2d')!;
-  cardCtx.fillStyle = '#151517';
+  cardCtx.fillStyle = '#232226';
   cardCtx.fillRect(0, 0, 1024, 576);
-  drawLinenGrain(cardCtx, 1024, 576, 0.025);
-  drawBrandMark(cardCtx, 476, 266, 1.65, '#f2efe8', brandName);
-  cardCtx.fillStyle = 'rgba(242, 239, 232, 0.56)';
+  drawLinenGrain(cardCtx, 1024, 576, 0.028);
+  cardCtx.strokeStyle = 'rgba(244, 240, 232, 0.18)';
+  cardCtx.lineWidth = 4;
+  cardCtx.strokeRect(18, 18, 1024 - 36, 576 - 36);
+  drawBrandMark(cardCtx, 512, 266, 1.85, '#f6f3ec', brandName, 'center');
+  cardCtx.fillStyle = 'rgba(246, 243, 236, 0.68)';
   cardCtx.font = '500 24px "Plus Jakarta Sans", sans-serif';
   cardCtx.textAlign = 'center';
   cardCtx.fillText('SPATIAL & EDITORIAL DESIGN', 512, 404);
@@ -492,6 +529,10 @@ function drawPaperBase(ctx: CanvasRenderingContext2D, w: number, h: number, base
     const py = seededNoise(i, 9.7) * h;
     ctx.fillRect(px, py, 2, 1.5);
   }
+  // Soft perimeter edge tone so light paper borders cleanly against charcoal bookcloth without stair-step aliasing
+  ctx.strokeStyle = 'rgba(130, 118, 100, 0.35)';
+  ctx.lineWidth = 4;
+  ctx.strokeRect(2, 2, w - 4, h - 4);
   ctx.restore();
 }
 
@@ -527,45 +568,42 @@ function drawContentsPage(
   brandName: string,
   hoveredProjectId: string | null,
 ): ContentsHitbox[] {
-  drawPaperBase(ctx, w, h, '#ebe3d4');
+  drawPaperBase(ctx, w, h, '#dbd0be');
 
-  // Top editorial bar (1920x1080 16:9 HD layout)
-  ctx.fillStyle = '#141311';
-  ctx.beginPath();
-  ctx.arc(136, 98, 11, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.font = '600 28px "Plus Jakarta Sans", sans-serif';
+  // Top editorial bar (logical 1920x1080 rendered onto supersampled canvas for crisp ink)
+  ctx.fillStyle = '#050403';
+  ctx.font = '600 40px "Plus Jakarta Sans", sans-serif';
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
-  ctx.fillText(brandName, 162, 98);
+  ctx.fillText(brandName, 112, 92);
 
-  ctx.fillStyle = '#2d2923';
-  ctx.font = '500 21px "JetBrains Mono", monospace';
-  ctx.fillText(`INDEX  ·  ${PHYSICAL_PAGE_COUNT}-PAGE EDITION`, 680, 98);
+  ctx.fillStyle = '#0e0c0a';
+  ctx.font = '600 30px "JetBrains Mono", monospace';
+  ctx.fillText(`INDEX  ·  ${PHYSICAL_PAGE_COUNT}-PAGE EDITION`, 604, 92);
 
-  ctx.strokeStyle = 'rgba(20, 19, 17, 0.28)';
-  ctx.lineWidth = 2;
+  ctx.strokeStyle = 'rgba(10, 9, 8, 0.44)';
+  ctx.lineWidth = 2.4;
   ctx.beginPath();
-  ctx.moveTo(124, 148);
-  ctx.lineTo(w - 124, 148);
+  ctx.moveTo(112, 144);
+  ctx.lineTo(w - 112, 144);
   ctx.stroke();
 
-  // Main Contents Heading
-  ctx.fillStyle = '#121110';
-  ctx.font = '500 90px "Fraunces", Georgia, serif';
+  // Main Contents Heading (balanced Georgia editorial serif keeps horizontal serifs legible at desk angle without heavy bolding)
+  ctx.fillStyle = '#040302';
+  ctx.font = '500 116px Georgia, "Fraunces", serif';
   ctx.textBaseline = 'alphabetic';
-  ctx.fillText('Contents', 124, 304);
+  ctx.fillText('Contents', 112, 306);
 
-  ctx.fillStyle = '#26231e';
-  ctx.font = '500 27px "Plus Jakarta Sans", sans-serif';
-  ctx.fillText('Select an entry to turn', 124, 362);
-  ctx.fillText('directly to its spread.', 124, 402);
+  ctx.fillStyle = '#080706';
+  ctx.font = '500 42px "Plus Jakarta Sans", sans-serif';
+  ctx.fillText('Select an entry to turn', 112, 378);
+  ctx.fillText('directly to its spread.', 112, 434);
 
-  // Two balanced columns for 16:9 wide proportion
+  // Two balanced columns with slightly larger, naturally weighted type for effortless reading
   const hitboxes: ContentsHitbox[] = [];
-  const colX = [680, 1260];
-  const startY = 266;
-  const rowHeight = 205;
+  const colX = [604, 1226];
+  const startY = 248;
+  const rowHeight = 236;
 
   type IndexRow = {
     id: string;
@@ -608,28 +646,28 @@ function drawContentsPage(
     const isHovered = hoveredProjectId === entry.id;
 
     if (isHovered) {
-      ctx.fillStyle = 'rgba(20, 19, 17, 0.08)';
-      ctx.fillRect(x - 24, y - 40, 500, 154);
+      ctx.fillStyle = 'rgba(17, 16, 14, 0.1)';
+      ctx.fillRect(x - 24, y - 46, 562, 188);
     }
 
-    ctx.fillStyle = isHovered ? '#8f3210' : entry.isUpcoming ? '#403b34' : '#2d2a24';
-    ctx.font = '500 21px "JetBrains Mono", monospace';
+    ctx.fillStyle = isHovered ? '#8f3210' : entry.isUpcoming ? '#231d17' : '#2d1a0a';
+    ctx.font = '600 32px "JetBrains Mono", monospace';
     ctx.textAlign = 'left';
     ctx.fillText(`${entry.indexNumber}  ·  p.${entry.pageNumber}`, x, y);
 
-    ctx.fillStyle = entry.isUpcoming ? '#2c2924' : '#121110';
-    ctx.font = '600 36px "Plus Jakarta Sans", sans-serif';
-    ctx.fillText(entry.title, x, y + 48);
+    ctx.fillStyle = entry.isUpcoming ? '#110f0d' : '#040302';
+    ctx.font = '600 56px "Plus Jakarta Sans", sans-serif';
+    ctx.fillText(entry.title, x, y + 62);
 
-    ctx.fillStyle = '#2d2a24';
-    ctx.font = '500 23px "Plus Jakarta Sans", sans-serif';
-    ctx.fillText(entry.category, x, y + 86);
+    ctx.fillStyle = '#0d0b09';
+    ctx.font = '500 36px "Plus Jakarta Sans", sans-serif';
+    ctx.fillText(entry.category, x, y + 112);
 
-    ctx.strokeStyle = isHovered ? 'rgba(143, 50, 16, 0.78)' : 'rgba(20, 19, 17, 0.24)';
-    ctx.lineWidth = 1.6;
+    ctx.strokeStyle = isHovered ? 'rgba(143, 50, 16, 0.86)' : 'rgba(10, 9, 8, 0.42)';
+    ctx.lineWidth = 2.4;
     ctx.beginPath();
-    ctx.moveTo(x, y + 114);
-    ctx.lineTo(x + 455, y + 114);
+    ctx.moveTo(x, y + 144);
+    ctx.lineTo(x + 518, y + 144);
     ctx.stroke();
 
     hitboxes.push({
@@ -638,100 +676,100 @@ function drawContentsPage(
       spreadIndex: entry.spreadIndex,
       side: entry.side,
       uMin: (x - 24) / w,
-      uMax: (x + 476) / w,
-      vMin: 1 - (y + 118) / h,
-      vMax: 1 - (y - 40) / h,
+      uMax: (x + 538) / w,
+      vMin: 1 - (y + 146) / h,
+      vMax: 1 - (y - 46) / h,
     });
   });
 
   // Footer folio
-  ctx.fillStyle = '#2c2924';
-  ctx.font = '500 20px "JetBrains Mono", monospace';
-  ctx.fillText('01', 124, h - 72);
-  ctx.fillText(`${DEMO_PROJECTS.length} ACTIVE WORKS  ·  ${PHYSICAL_PAGE_COUNT} PP`, w - 455, h - 72);
+  ctx.fillStyle = '#0e0c0a';
+  ctx.font = '600 30px "JetBrains Mono", monospace';
+  ctx.fillText('01', 112, h - 60);
+  ctx.fillText(`${DEMO_PROJECTS.length} ACTIVE WORKS  ·  ${PHYSICAL_PAGE_COUNT} PP`, w - 588, h - 60);
 
   drawGutterShadow(ctx, w, h, 'left');
   return hitboxes;
 }
 
 function drawComingSoonPage(ctx: CanvasRenderingContext2D, w: number, h: number, brandName: string) {
-  drawPaperBase(ctx, w, h, '#ebe3d4');
+  drawPaperBase(ctx, w, h, '#dcd1bf');
 
-  ctx.fillStyle = '#2e2a24';
-  ctx.font = '500 22px "JetBrains Mono", monospace';
+  ctx.fillStyle = '#14120f';
+  ctx.font = '600 28px "JetBrains Mono", monospace';
   ctx.textAlign = 'left';
-  ctx.fillText('EDITION HORIZON  ·  MORE TO COME', 148, 114);
+  ctx.fillText('EDITION HORIZON  ·  MORE TO COME', 140, 112);
 
-  ctx.strokeStyle = 'rgba(20, 19, 17, 0.25)';
-  ctx.lineWidth = 2;
+  ctx.strokeStyle = 'rgba(17, 16, 14, 0.32)';
+  ctx.lineWidth = 2.2;
   ctx.beginPath();
-  ctx.moveTo(148, 150);
-  ctx.lineTo(w - 148, 150);
+  ctx.moveTo(140, 152);
+  ctx.lineTo(w - 140, 152);
   ctx.stroke();
 
-  ctx.fillStyle = '#141311';
-  ctx.font = '500 88px "Fraunces", Georgia, serif';
-  ctx.fillText('More works', 148, 344);
-  ctx.fillText('coming soon.', 148, 444);
+  ctx.fillStyle = '#090806';
+  ctx.font = '600 100px "Fraunces", Georgia, serif';
+  ctx.fillText('More works', 140, 336);
+  ctx.fillText('coming soon.', 140, 444);
 
-  ctx.fillStyle = '#24211c';
-  ctx.font = '500 34px "Plus Jakarta Sans", sans-serif';
+  ctx.fillStyle = '#110f0c';
+  ctx.font = '500 40px "Plus Jakarta Sans", sans-serif';
   const lines = [
     'This 20-page volume holds space for upcoming websites,',
     'interactive experiments, and client releases as they ship.',
     'Click any earlier spread to inspect full case notes.',
   ];
   lines.forEach((line, i) => {
-    ctx.fillText(line, 148, 548 + i * 54);
+    ctx.fillText(line, 140, 548 + i * 60);
   });
 
-  ctx.fillStyle = '#332e27';
-  ctx.font = '500 23px "JetBrains Mono", monospace';
-  ctx.fillText('ACTIVE RANGE   ·  PAGES 01 – 07', 148, 768);
-  ctx.fillText('RESERVED       ·  PAGES 08 – 20', 148, 812);
+  ctx.fillStyle = '#14120f';
+  ctx.font = '600 28px "JetBrains Mono", monospace';
+  ctx.fillText('ACTIVE RANGE   ·  PAGES 01 – 07', 140, 774);
+  ctx.fillText('RESERVED       ·  PAGES 08 – 20', 140, 822);
 
-  drawBrandMark(ctx, 224, h - 134, 1.45, '#141414', brandName);
+  drawBrandMark(ctx, 140, h - 134, 1.5, '#090806', brandName, 'left');
 
-  ctx.fillStyle = '#2e2a24';
-  ctx.font = '500 20px "JetBrains Mono", monospace';
-  ctx.fillText('07', 148, h - 72);
+  ctx.fillStyle = '#14120f';
+  ctx.font = '600 26px "JetBrains Mono", monospace';
+  ctx.fillText('07', 140, h - 66);
 
   drawGutterShadow(ctx, w, h, 'left');
 }
 
 function drawReservedStackPage(ctx: CanvasRenderingContext2D, w: number, h: number) {
-  drawPaperBase(ctx, w, h, '#e3dbc9');
+  drawPaperBase(ctx, w, h, '#d7cdba');
 
   // Restrained ruled endpaper indicating sealed remaining pages (pp. 08-20)
-  ctx.strokeStyle = 'rgba(20, 19, 17, 0.16)';
-  ctx.lineWidth = 1.6;
-  ctx.strokeRect(128, 100, w - 256, h - 200);
+  ctx.strokeStyle = 'rgba(17, 16, 14, 0.22)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(120, 96, w - 240, h - 192);
 
-  ctx.strokeStyle = 'rgba(20, 19, 17, 0.09)';
+  ctx.strokeStyle = 'rgba(17, 16, 14, 0.1)';
   for (let y = 210; y <= h - 220; y += 58) {
     ctx.beginPath();
-    ctx.moveTo(210, y);
-    ctx.lineTo(w - 210, y);
+    ctx.moveTo(200, y);
+    ctx.lineTo(w - 200, y);
     ctx.stroke();
   }
 
-  ctx.fillStyle = '#2f2b25';
-  ctx.font = '500 24px "JetBrains Mono", monospace';
+  ctx.fillStyle = '#161411';
+  ctx.font = '600 30px "JetBrains Mono", monospace';
   ctx.textAlign = 'center';
-  ctx.fillText('PAGES 08 – 20  ·  RESERVED', w / 2, h / 2 - 44);
+  ctx.fillText('PAGES 08 – 20  ·  RESERVED', w / 2, h / 2 - 52);
 
-  ctx.fillStyle = '#181613';
-  ctx.font = '500 54px "Fraunces", Georgia, serif';
+  ctx.fillStyle = '#090806';
+  ctx.font = '600 66px "Fraunces", Georgia, serif';
   ctx.fillText('Next chapters in production', w / 2, h / 2 + 26);
 
-  ctx.fillStyle = '#2e2a24';
-  ctx.font = '500 27px "Plus Jakarta Sans", sans-serif';
-  ctx.fillText('Forward flipping stops here until new projects are added.', w / 2, h / 2 + 94);
+  ctx.fillStyle = '#12100d';
+  ctx.font = '500 36px "Plus Jakarta Sans", sans-serif';
+  ctx.fillText('Forward flipping stops here until new projects are added.', w / 2, h / 2 + 102);
 
   ctx.textAlign = 'left';
-  ctx.fillStyle = '#2f2b25';
-  ctx.font = '500 20px "JetBrains Mono", monospace';
-  ctx.fillText('08 / 20', w - 245, h - 72);
+  ctx.fillStyle = '#161411';
+  ctx.font = '600 26px "JetBrains Mono", monospace';
+  ctx.fillText('08 / 20', w - 258, h - 66);
 
   drawGutterShadow(ctx, w, h, 'right');
 }
@@ -867,7 +905,8 @@ function drawProjectArt(
       ctx.fillStyle = barkGrad;
       ctx.fill();
 
-      for (let i = 0; i < 64; i++) {
+      const canopyStep = t > 0 ? 2 : 1;
+      for (let i = 0; i < 64; i += canopyStep) {
         const u = i / 63;
         const bx = w * (0.14 + u * 0.84) + Math.sin(i * 4.3) * 26;
         const by =
@@ -875,7 +914,7 @@ function drawProjectArt(
           Math.sin(u * Math.PI) * 24 +
           Math.cos(i * 2.9) * 24 +
           Math.sin(t * 1.8 + i * 0.4) * (t > 0 ? 4.5 : 0);
-        const rad = 24 + seededNoise(i, 4.1) * 40;
+        const rad = (24 + seededNoise(i, 4.1) * 40) * (t > 0 ? 1.12 : 1.0);
         const shade = seededNoise(i, 9.2);
         ctx.fillStyle =
           shade > 0.66
@@ -896,23 +935,23 @@ function drawProjectArt(
       }
       ctx.restore();
 
-      ctx.fillStyle = 'rgba(255,255,255,0.92)';
-      ctx.font = '600 24px "Plus Jakarta Sans", sans-serif';
+      ctx.fillStyle = 'rgba(255,255,255,0.96)';
+      ctx.font = '600 28px "Plus Jakarta Sans", sans-serif';
       ctx.fillText('STRATA CANOPY', 112, 92);
-      ctx.fillStyle = 'rgba(255,255,255,0.82)';
-      ctx.font = '500 19px "JetBrains Mono", monospace';
-      ctx.fillText('DEMO  ·  SPATIAL MONOGRAPH', w - 430, 92);
+      ctx.fillStyle = 'rgba(255,255,255,0.88)';
+      ctx.font = '600 24px "JetBrains Mono", monospace';
+      ctx.fillText('DEMO  ·  SPATIAL MONOGRAPH', w - 500, 92);
 
       ctx.fillStyle = '#ffffff';
-      ctx.font = '600 112px "Plus Jakarta Sans", sans-serif';
+      ctx.font = '600 116px "Plus Jakarta Sans", sans-serif';
       ctx.fillText('Every layer', 112, 278);
-      ctx.fillText('tells a story.', 112, 392);
+      ctx.fillText('tells a story.', 112, 396);
 
       ctx.fillStyle = '#cfe556';
-      ctx.fillRect(w - 374, h - 144, 260, 64);
+      ctx.fillRect(w - 394, h - 148, 282, 68);
       ctx.fillStyle = '#111706';
-      ctx.font = '600 22px "Plus Jakarta Sans", sans-serif';
-      ctx.fillText('View project  →', w - 332, h - 104);
+      ctx.font = '600 26px "Plus Jakarta Sans", sans-serif';
+      ctx.fillText('View project  →', w - 344, h - 104);
       break;
     }
 
@@ -940,20 +979,20 @@ function drawProjectArt(
       ctx.fillRect(1130, 258 + gridShift * 0.4, 470, 450);
 
       ctx.fillStyle = '#d4513b';
-      ctx.fillRect(116, 94, 32, 32);
+      ctx.fillRect(116, 94, 34, 34);
 
       ctx.fillStyle = '#f5f2eb';
-      ctx.font = '500 22px "JetBrains Mono", monospace';
-      ctx.fillText('02  ·  MONOLITH PRESS  ·  DEMO', 174, 118);
+      ctx.font = '600 26px "JetBrains Mono", monospace';
+      ctx.fillText('02  ·  MONOLITH PRESS  ·  DEMO', 176, 120);
 
-      ctx.font = '500 98px "Fraunces", Georgia, serif';
-      ctx.fillText('The weight', 116, 324);
-      ctx.fillText('of silent', 116, 428);
-      ctx.fillText('pages.', 116, 532);
+      ctx.font = '600 102px "Fraunces", Georgia, serif';
+      ctx.fillText('The weight', 116, 326);
+      ctx.fillText('of silent', 116, 434);
+      ctx.fillText('pages.', 116, 542);
 
-      ctx.fillStyle = '#a8a49c';
-      ctx.font = '500 27px "Plus Jakarta Sans", sans-serif';
-      ctx.fillText('Monochrome exhibition grid & broadsheet system.', 116, h - 106);
+      ctx.fillStyle = '#c4bfb6';
+      ctx.font = '500 34px "Plus Jakarta Sans", sans-serif';
+      ctx.fillText('Monochrome exhibition grid & broadsheet system.', 116, h - 98);
       break;
     }
 
@@ -993,24 +1032,23 @@ function drawProjectArt(
         ctx.stroke();
       }
 
-      ctx.fillStyle = 'rgba(255, 243, 230, 0.82)';
-      ctx.font = '500 22px "JetBrains Mono", monospace';
-      ctx.fillText('03  ·  SOLSTICE RECORDINGS  ·  DEMO', 116, 94);
+      ctx.fillStyle = 'rgba(255, 243, 230, 0.92)';
+      ctx.font = '600 26px "JetBrains Mono", monospace';
+      ctx.fillText('03  ·  SOLSTICE RECORDINGS  ·  DEMO', 116, 96);
 
       ctx.fillStyle = '#fff5eb';
-      ctx.font = '600 98px "Plus Jakarta Sans", sans-serif';
-      ctx.fillText('Solstice Tape', 116, 244);
-      ctx.fillStyle = '#f2c396';
-      ctx.font = '400 34px "Fraunces", Georgia, serif';
-      ctx.fillText('Theo Vance — Analog studio sessions', 116, 306);
+      ctx.font = '600 102px "Plus Jakarta Sans", sans-serif';
+      ctx.fillText('Solstice Tape', 116, 246);
+      ctx.fillStyle = '#f6cfa9';
+      ctx.font = '500 38px "Fraunces", Georgia, serif';
+      ctx.fillText('Theo Vance — Analog studio sessions', 116, 312);
 
-      ctx.fillStyle = 'rgba(255, 245, 235, 0.14)';
-      ctx.strokeStyle = 'rgba(255, 245, 235, 0.52)';
+      ctx.strokeStyle = 'rgba(255, 245, 235, 0.58)';
       ctx.lineWidth = 2;
-      ctx.strokeRect(w - 374, h - 144, 260, 64);
+      ctx.strokeRect(w - 394, h - 148, 282, 68);
       ctx.fillStyle = '#fff5eb';
-      ctx.font = '500 22px "Plus Jakarta Sans", sans-serif';
-      ctx.fillText('View project  →', w - 332, h - 104);
+      ctx.font = '600 26px "Plus Jakarta Sans", sans-serif';
+      ctx.fillText('View project  →', w - 344, h - 104);
       break;
     }
 
@@ -1053,7 +1091,7 @@ function drawProjectArt(
       ctx.fillStyle = floorRef;
       ctx.fillRect(0, h * 0.68, w, h * 0.32);
 
-      for (let i = 0; i < 32; i++) {
+      for (let i = 0; i < 28; i++) {
         const px = w * (0.26 + seededNoise(i, 2.2) * 0.5);
         const baseY = h * (0.24 + seededNoise(i, 5.1) * 0.5);
         const py = ((baseY - t * 32 + h) % (h * 0.65)) + h * 0.16;
@@ -1063,15 +1101,15 @@ function drawProjectArt(
         ctx.fill();
       }
 
-      ctx.fillStyle = '#9dd8ff';
-      ctx.font = '500 22px "JetBrains Mono", monospace';
-      ctx.fillText('04  ·  SUBSURFACE ARCHIVE  ·  DEMO', 116, 94);
+      ctx.fillStyle = '#b4e4ff';
+      ctx.font = '600 26px "JetBrains Mono", monospace';
+      ctx.fillText('04  ·  SUBSURFACE ARCHIVE  ·  DEMO', 116, 96);
 
       ctx.fillStyle = '#f2f9ff';
-      ctx.font = '500 68px "Fraunces", Georgia, serif';
-      ctx.fillText('See through complexity.', 116, h - 186);
-      ctx.fillStyle = '#7ec8f8';
-      ctx.fillText('Find what matters.', 116, h - 108);
+      ctx.font = '600 72px "Fraunces", Georgia, serif';
+      ctx.fillText('See through complexity.', 116, h - 188);
+      ctx.fillStyle = '#8ad0fa';
+      ctx.fillText('Find what matters.', 116, h - 104);
       break;
     }
 
@@ -1079,9 +1117,9 @@ function drawProjectArt(
       ctx.fillStyle = '#111214';
       ctx.fillRect(0, 0, w, h);
 
-      ctx.fillStyle = '#9b9ea5';
-      ctx.font = '500 22px "JetBrains Mono", monospace';
-      ctx.fillText('05  ·  NOCTURNE OS  ·  DEMO', 116, 94);
+      ctx.fillStyle = '#b8bcc4';
+      ctx.font = '600 26px "JetBrains Mono", monospace';
+      ctx.fillText('05  ·  NOCTURNE OS  ·  DEMO', 116, 96);
 
       ctx.fillStyle = '#f5f5f2';
       ctx.font = '700 184px "JetBrains Mono", monospace';
@@ -1132,7 +1170,7 @@ function drawProjectArt(
       ctx.fillText('6:34', phoneX + phoneW / 2, phoneY + 205);
       if (t > 0) {
         ctx.fillStyle = '#e04f3a';
-        ctx.font = '500 20px "JetBrains Mono", monospace';
+        ctx.font = '600 22px "JetBrains Mono", monospace';
         ctx.fillText(`:${secStr} LIVE`, phoneX + phoneW / 2, phoneY + 246);
       }
       ctx.restore();
@@ -1153,7 +1191,8 @@ function drawProjectArt(
 }
 
 /**
- * Creates a full-HD 16:9 (1920x1080) CanvasTexture handle for a given page slot.
+ * Creates a dynamically supersampled 16:9 CanvasTexture for static reading (up to 3840x2160 4K at 2.0x)
+ * plus a zero-mipmap 960x540 liveTexture for lag-free hover/video animation.
  */
 export function createPageTextureHandle(
   slot: PageSlot,
@@ -1161,22 +1200,52 @@ export function createPageTextureHandle(
   brandName: string,
   maxAnisotropy: number,
   onMediaReady?: () => void,
+  initialSupersampleScale = 1.5,
 ): PageTextureHandle {
+  let staticScale = Math.max(1.0, Math.min(2.0, initialSupersampleScale));
   const canvas = document.createElement('canvas');
-  canvas.width = 1920;
-  canvas.height = 1080;
+  canvas.width = Math.round(1920 * staticScale);
+  canvas.height = Math.round(1080 * staticScale);
   const ctx = canvas.getContext('2d')!;
 
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.anisotropy = maxAnisotropy;
-  texture.minFilter = THREE.LinearMipmapLinearFilter;
-  texture.magFilter = THREE.LinearFilter;
+  const buildStaticTexture = () => {
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.anisotropy = maxAnisotropy;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    return tex;
+  };
+
+  let texture = buildStaticTexture();
+
+  let liveCanvas: HTMLCanvasElement | null = null;
+  let liveCtx: CanvasRenderingContext2D | null = null;
+  let liveTex: THREE.CanvasTexture | null = null;
+
+  const ensureLiveSurface = () => {
+    if (liveTex && liveCanvas && liveCtx) {
+      return { liveCanvas, liveCtx, liveTex };
+    }
+    liveCanvas = document.createElement('canvas');
+    liveCanvas.width = 960;
+    liveCanvas.height = 540;
+    liveCtx = liveCanvas.getContext('2d')!;
+    liveTex = new THREE.CanvasTexture(liveCanvas);
+    liveTex.colorSpace = THREE.SRGBColorSpace;
+    liveTex.generateMipmaps = false;
+    liveTex.minFilter = THREE.LinearFilter;
+    liveTex.magFilter = THREE.LinearFilter;
+    liveTex.anisotropy = maxAnisotropy;
+    return { liveCanvas, liveCtx, liveTex };
+  };
 
   let contentsHitboxes: ContentsHitbox[] = [];
   let loadedImg: HTMLImageElement | null = null;
   let videoEl: HTMLVideoElement | null = null;
   let disposed = false;
+  let lastHovered = false;
+  let lastHoveredProjectId: string | null = null;
 
   if (slot.kind === 'project') {
     const media = slot.project.media;
@@ -1186,7 +1255,7 @@ export function createPageTextureHandle(
       img.onload = () => {
         if (disposed) return;
         loadedImg = img;
-        render(0, false, null);
+        render(0, lastHovered, lastHoveredProjectId);
         onMediaReady?.();
       };
       img.src = media.screenshotUrl;
@@ -1201,28 +1270,34 @@ export function createPageTextureHandle(
       video.preload = 'metadata';
       video.onloadeddata = () => {
         if (disposed) return;
-        render(0, false, null);
+        render(0, lastHovered, lastHoveredProjectId);
         onMediaReady?.();
       };
       videoEl = video;
     }
   }
 
-  const render = (timeSec: number, hovered: boolean, hoveredProjectId: string | null = null) => {
+  const drawIntoTarget = (
+    targetCtx: CanvasRenderingContext2D,
+    logicalW: number,
+    logicalH: number,
+    timeSec: number,
+    hovered: boolean,
+    hoveredProjectId: string | null,
+  ) => {
     if (slot.kind === 'contents') {
       contentsHitboxes = drawContentsPage(
-        ctx,
-        canvas.width,
-        canvas.height,
+        targetCtx,
+        logicalW,
+        logicalH,
         brandName,
         hoveredProjectId,
       );
     } else if (slot.kind === 'coming-soon') {
-      drawComingSoonPage(ctx, canvas.width, canvas.height, brandName);
+      drawComingSoonPage(targetCtx, logicalW, logicalH, brandName);
     } else if (slot.kind === 'reserved-stack') {
-      drawReservedStackPage(ctx, canvas.width, canvas.height);
+      drawReservedStackPage(targetCtx, logicalW, logicalH);
     } else {
-      // Manage video playback when previewing or hovering
       if (videoEl) {
         if (timeSec > 0 || hovered) {
           if (videoEl.paused) {
@@ -1239,9 +1314,9 @@ export function createPageTextureHandle(
           : loadedImg;
 
       drawProjectArt(
-        ctx,
-        canvas.width,
-        canvas.height,
+        targetCtx,
+        logicalW,
+        logicalH,
         slot.project,
         side,
         timeSec,
@@ -1249,16 +1324,57 @@ export function createPageTextureHandle(
         activeMedia,
       );
     }
+  };
+
+  const render = (timeSec: number, hovered: boolean, hoveredProjectId: string | null = null) => {
+    lastHovered = hovered;
+    lastHoveredProjectId = hoveredProjectId;
+    ctx.save();
+    ctx.setTransform(staticScale, 0, 0, staticScale, 0, 0);
+    drawIntoTarget(ctx, 1920, 1080, timeSec, hovered, hoveredProjectId);
+    ctx.restore();
     texture.needsUpdate = true;
+  };
+
+  const setSupersampleScale = (nextScale: number): boolean => {
+    const clamped = Math.max(1.0, Math.min(2.0, nextScale));
+    if (Math.abs(clamped - staticScale) < 0.05) return false;
+    staticScale = clamped;
+    canvas.width = Math.round(1920 * staticScale);
+    canvas.height = Math.round(1080 * staticScale);
+    texture.dispose();
+    texture = buildStaticTexture();
+    render(0, lastHovered, lastHoveredProjectId);
+    return true;
+  };
+
+  const renderLiveFrame = (timeSec: number, hovered: boolean): THREE.CanvasTexture => {
+    const { liveCtx: lCtx, liveTex: lTex } = ensureLiveSurface();
+    lCtx.save();
+    lCtx.setTransform(0.5, 0, 0, 0.5, 0, 0);
+    drawIntoTarget(lCtx, 1920, 1080, timeSec, hovered, null);
+    lCtx.restore();
+    lTex.needsUpdate = true;
+    return lTex;
   };
 
   // Initial static render
   render(0, false, null);
 
   return {
-    texture,
+    get texture() {
+      return texture;
+    },
+    get liveTexture() {
+      return ensureLiveSurface().liveTex;
+    },
     canvas,
+    get supersampleScale() {
+      return staticScale;
+    },
+    setSupersampleScale,
     render,
+    renderLiveFrame,
     get contentsHitboxes() {
       return contentsHitboxes;
     },
@@ -1272,6 +1388,7 @@ export function createPageTextureHandle(
       }
       loadedImg = null;
       texture.dispose();
+      liveTex?.dispose();
     },
   };
 }
