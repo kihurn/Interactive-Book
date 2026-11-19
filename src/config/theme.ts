@@ -182,15 +182,24 @@ export const SITE_CONFIG: SiteConfig = {
     inquiryUrl: import.meta.env?.VITE_CONTACT_URL || null,
     channels: [
       {
-        label: 'Direct Email',
-        value: import.meta.env?.VITE_CONTACT_EMAIL || 'Not configured — set VITE_CONTACT_EMAIL in .env',
-        href: import.meta.env?.VITE_CONTACT_EMAIL ? `mailto:${import.meta.env.VITE_CONTACT_EMAIL}` : null,
+        label: 'GitHub',
+        value: 'github.com/kihurn',
+        href: 'https://github.com/kihurn',
       },
       {
-        label: 'Studio Inquiry',
-        value: import.meta.env?.VITE_CONTACT_URL || 'Local preview inquiry composer active',
-        href: import.meta.env?.VITE_CONTACT_URL || null,
+        label: 'Direct Email',
+        value: import.meta.env?.VITE_CONTACT_EMAIL || 'wongkihurn@gmail.com',
+        href: `mailto:${import.meta.env?.VITE_CONTACT_EMAIL || 'wongkihurn@gmail.com'}`,
       },
+      ...(import.meta.env?.VITE_CONTACT_URL
+        ? [
+            {
+              label: 'Studio Inquiry',
+              value: import.meta.env.VITE_CONTACT_URL,
+              href: import.meta.env.VITE_CONTACT_URL,
+            },
+          ]
+        : []),
     ],
   },
 };

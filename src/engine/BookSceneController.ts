@@ -31,25 +31,35 @@ import {
   type BookControllerState,
   type PageSide,
 } from './bookState';
-import { createDeskProps, type DeskPropsRig } from './props';
-import { enhanceDeskShader, VignetteGradingShader } from './shaders';
+import { VignetteGradingShader } from './shaders';
 import {
   createBookStaticTextures,
-  createDeskTextures,
   createPageTextureHandle,
+  type BookStaticTextureSet,
   type PageTextureHandle,
 } from './textures';
+import { DeskEnvironment } from '../scene/environments/DeskEnvironment';
+import { PondEnvironment } from '../scene/environments/PondEnvironment';
+import {
+  DEFAULT_ENVIRONMENT,
+  type EnvironmentId,
+  type SceneEnvironment,
+} from '../scene/environments/types';
 
 export interface BookSceneCallbacks {
   onStateChange: (state: BookControllerState) => void;
   onHoverProject: (project: ProjectItem | null, side: PageSide | null) => void;
   onCursorInteractiveChange?: (interactive: boolean) => void;
+  onCardHoverChange?: (hovered: boolean, screenPos?: { x: number; y: number }) => void;
+  onOpenContact?: () => void;
   onSelectProject: (project: ProjectItem) => void;
   onWebGLFailed: (reason: string) => void;
   onReady: () => void;
 }
 
 export class BookSceneController {
+  private static readonly SURFACE_Y = 0;
+
   private container: HTMLElement;
   private theme: SceneTheme;
   private callbacks: BookSceneCallbacks;
@@ -61,7 +71,10 @@ export class BookSceneController {
   private scene!: THREE.Scene;
   private camera!: THREE.PerspectiveCamera;
   private bookRig!: BookRig;
-  private propsRig!: DeskPropsRig;
+  private staticTextures!: BookStaticTextureSet;
+  private environments = new Map<EnvironmentId, SceneEnvironment>();
+  private initializedEnvs = new Set<EnvironmentId>();
+  private activeEnvId: EnvironmentId = DEFAULT_ENVIRONMENT;
   private keyLight!: THREE.DirectionalLight;
   private deskLamp!: THREE.SpotLight;
   private hemiLight!: THREE.HemisphereLight;
@@ -71,6 +84,9 @@ export class BookSceneController {
   private renderBusy = false;
   private renderDirty = false;
   private frameId = 0;
+  private pondTickId = 0;
+  private envStartMs = 0;
+  private lastEnvUpdateMs = 0;
   private previewAnimId = 0;
   private parallaxAnimId = 0;
   private parallaxLastMs = 0;
@@ -137,12 +153,17 @@ export class BookSceneController {
     container: HTMLElement,
     theme: SceneTheme,
     callbacks: BookSceneCallbacks,
-    options: { autostart?: boolean; reducedMotion?: boolean } = {},
+    options: {
+      autostart?: boolean;
+      reducedMotion?: boolean;
+      initialEnvironment?: EnvironmentId;
+    } = {},
   ) {
     this.container = container;
     this.theme = theme;
     this.callbacks = callbacks;
     this.reducedMotion = Boolean(options.reducedMotion);
+    this.activeEnvId = options.initialEnvironment ?? DEFAULT_ENVIRONMENT;
     this.state = createInitialBookState(
       BOOK_SPREADS.length,
       Boolean(options.autostart),
@@ -192,7 +213,7 @@ export class BookSceneController {
   }
 
   private invalidateShadows() {
-    if (this.renderer && !this.isSoftwareGl) {
+    if (this.renderer) {
       this.renderer.shadowMap.needsUpdate = true;
     }
   }
@@ -330,8 +351,137 @@ export class BookSceneController {
 
   private syncPropsForViewport() {
     const tier = this.getViewportTier();
-    this.propsRig.applyLayout(this.theme.props[tier]);
+    const activeEnv = this.environments.get(this.activeEnvId);
+    if (activeEnv && this.initializedEnvs.has(this.activeEnvId)) {
+      activeEnv.applyViewportLayout?.(tier);
+      this.invalidateShadows();
+    }
+  }
+
+  private getActiveEnvironment() {
+    return this.environments.get(this.activeEnvId);
+  }
+
+  private ensureEnvironmentInitialized(id: EnvironmentId) {
+    const env = this.environments.get(id);
+    if (!env || this.initializedEnvs.has(id)) return env;
+    this.initializedEnvs.add(id);
+    const maxAniso = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+    env.init({
+      scene: this.scene,
+      renderer: this.renderer,
+      camera: this.camera,
+      surfaceY: BookSceneController.SURFACE_Y,
+      isSoftwareGl: this.isSoftwareGl,
+      maxAnisotropy: maxAniso,
+      lampPosition: this.theme.lighting.spotPosition,
+      bookGroup: this.bookRig.group,
+      getBookOpenProgress: () => this.animProxy.openProgress,
+      onOpenContact: () => this.callbacks.onOpenContact?.(),
+      onCardHoverChange: (hovered, screenPos) =>
+        this.callbacks.onCardHoverChange?.(hovered, screenPos),
+      onCursorInteractiveChange: (interactive) => this.setCursorInteractive(interactive),
+      onRequestRender: () => this.requestRender(),
+    });
+    env.applyViewportLayout?.(this.getViewportTier());
+    return env;
+  }
+
+  private configureShadowFrustum(id: EnvironmentId) {
+    if (!this.keyLight) return;
+    if (id === 'pond') {
+      this.keyLight.shadow.camera.left = -4.0;
+      this.keyLight.shadow.camera.right = 4.0;
+      this.keyLight.shadow.camera.top = 3.0;
+      this.keyLight.shadow.camera.bottom = -3.0;
+      this.keyLight.shadow.camera.near = 0.5;
+      this.keyLight.shadow.camera.far = 11.5;
+      this.keyLight.shadow.bias = -0.00035;
+      this.keyLight.shadow.normalBias = 0.02;
+      this.keyLight.shadow.radius = 4.2;
+    } else {
+      this.keyLight.shadow.camera.left = -2.6;
+      this.keyLight.shadow.camera.right = 2.6;
+      this.keyLight.shadow.camera.top = 1.7;
+      this.keyLight.shadow.camera.bottom = -1.7;
+      this.keyLight.shadow.camera.near = 0.6;
+      this.keyLight.shadow.camera.far = 8.5;
+      this.keyLight.shadow.bias = -0.00025;
+      this.keyLight.shadow.normalBias = 0.0028;
+      this.keyLight.shadow.radius = 4.5;
+    }
+    this.keyLight.shadow.camera.updateProjectionMatrix();
+  }
+
+  private applyEnvironmentAtmosphere(id: EnvironmentId) {
+    if (!this.scene || !this.keyLight || !this.deskLamp || !this.hemiLight || !this.rimLight) {
+      return;
+    }
+    if (id === 'pond') {
+      const pondBg = '#071012';
+      this.scene.background = new THREE.Color(pondBg);
+      this.scene.fog = new THREE.FogExp2(pondBg, 0.064);
+      this.keyLight.color.set('#f4f9ef');
+      this.deskLamp.color.set('#fff4e4');
+      this.hemiLight.color.set('#8dbab5');
+      this.hemiLight.groundColor.set('#0d1b19');
+      this.rimLight.color.set('#c4dfd9');
+    } else {
+      this.scene.background = new THREE.Color(this.theme.palette.background);
+      this.scene.fog = new THREE.FogExp2(this.theme.palette.background, 0.072);
+      this.keyLight.color.set(this.theme.lighting.keyColor);
+      this.deskLamp.color.set(this.theme.lighting.spotColor);
+      this.hemiLight.color.set(this.theme.lighting.hemiSkyColor);
+      this.hemiLight.groundColor.set(this.theme.lighting.hemiGroundColor);
+      this.rimLight.color.set(this.theme.lighting.rimColor);
+    }
+    this.configureShadowFrustum(id);
+    this.applyPhaseLighting(this.animProxy.openProgress);
+  }
+
+  public setEnvironment(id: EnvironmentId) {
+    if (this.disposed || id === this.activeEnvId) return;
+    const prevEnv = this.environments.get(this.activeEnvId);
+    prevEnv?.clearHover?.();
+    prevEnv?.setActive(false);
+
+    this.stopPondLoop();
+    this.activeEnvId = id;
+    this.callbacks.onCardHoverChange?.(false);
+
+    const nextEnv = this.ensureEnvironmentInitialized(id);
+    if (nextEnv) {
+      nextEnv.applyViewportLayout?.(this.getViewportTier());
+      nextEnv.setActive(true);
+    }
+    this.applyEnvironmentAtmosphere(id);
     this.invalidateShadows();
+    this.lastEnvUpdateMs = performance.now();
+
+    if (id === 'pond' && !this.isDocumentHidden) {
+      this.startPondLoop();
+    }
+    this.requestRender();
+  }
+
+  private startPondLoop() {
+    if (this.pondTickId || this.disposed || this.activeEnvId !== 'pond' || this.isDocumentHidden) {
+      return;
+    }
+    const tick = () => {
+      this.pondTickId = 0;
+      if (this.disposed || this.activeEnvId !== 'pond' || this.isDocumentHidden) return;
+      this.requestRender();
+    };
+    this.pondTickId = requestAnimationFrame(tick);
+  }
+
+  private stopPondLoop() {
+    if (this.pondTickId) {
+      cancelAnimationFrame(this.pondTickId);
+      clearTimeout(this.pondTickId);
+      this.pondTickId = 0;
+    }
   }
 
   private createLamplitStudioEnvScene(): THREE.Scene {
@@ -449,6 +599,18 @@ export class BookSceneController {
   private applyPhaseLighting(openProgress: number) {
     if (!this.deskLamp || !this.keyLight || !this.hemiLight || !this.rimLight) return;
     const vals = computePhaseLighting(openProgress, this.theme.lighting);
+    if (this.activeEnvId === 'pond') {
+      this.deskLamp.intensity = vals.spotIntensity * 0.56;
+      this.deskLamp.angle = vals.spotAngle;
+      this.deskLamp.penumbra = vals.spotPenumbra;
+      this.keyLight.intensity = vals.keyIntensity * 1.48;
+      // Angle afternoon sunlight from upper-right through the bamboo grove onto boulders & pond water
+      this.keyLight.position.set(1.92, 4.15, -1.18);
+      this.hemiLight.intensity = Math.max(0.32, vals.hemiIntensity * 1.38);
+      this.rimLight.intensity = vals.rimIntensity * 0.88;
+      this.scene.environmentIntensity = Math.max(0.28, vals.environmentIntensity * 0.78);
+      return;
+    }
     this.deskLamp.intensity = vals.spotIntensity;
     this.deskLamp.angle = vals.spotAngle;
     this.deskLamp.penumbra = vals.spotPenumbra;
@@ -477,7 +639,7 @@ export class BookSceneController {
         this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 1.5),
       );
       this.renderer.setSize(width, height);
-      this.renderer.shadowMap.enabled = !this.isSoftwareGl;
+      this.renderer.shadowMap.enabled = true;
       this.renderer.shadowMap.autoUpdate = false;
       this.renderer.shadowMap.type = THREE.PCFShadowMap;
       this.renderer.domElement.style.display = 'block';
@@ -527,18 +689,9 @@ export class BookSceneController {
         this.theme.lighting.keyPosition.y,
         this.theme.lighting.keyPosition.z,
       );
-      this.keyLight.castShadow = !this.isSoftwareGl;
-      const shadowMapRes = this.isSoftwareGl ? 1024 : 2048;
-      this.keyLight.shadow.mapSize.set(shadowMapRes, shadowMapRes);
-      this.keyLight.shadow.camera.left = -2.6;
-      this.keyLight.shadow.camera.right = 2.6;
-      this.keyLight.shadow.camera.top = 1.7;
-      this.keyLight.shadow.camera.bottom = -1.7;
-      this.keyLight.shadow.camera.near = 0.6;
-      this.keyLight.shadow.camera.far = 8.5;
-      this.keyLight.shadow.bias = -0.00025;
-      this.keyLight.shadow.normalBias = 0.0028;
-      this.keyLight.shadow.radius = 4.5;
+      this.keyLight.castShadow = true;
+      this.keyLight.shadow.mapSize.set(2048, 2048);
+      this.configureShadowFrustum(this.activeEnvId);
       this.scene.add(this.keyLight);
 
       this.deskLamp = new THREE.SpotLight(
@@ -612,73 +765,19 @@ export class BookSceneController {
       this.composer.addPass(new OutputPass());
 
       const maxAniso = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
-      const deskTextures = createDeskTextures(this.theme, maxAniso);
-      const staticTextures = createBookStaticTextures(this.theme, SITE_CONFIG.brandName, maxAniso);
+      this.staticTextures = createBookStaticTextures(this.theme, SITE_CONFIG.brandName, maxAniso);
 
-      // Desk surface extending seamlessly without visible horizon
-      const deskGeo = new THREE.PlaneGeometry(18, 14, 1, 1);
-      deskGeo.rotateX(-Math.PI / 2);
-      const deskMat = new THREE.MeshStandardMaterial({
-        map: deskTextures.baseColor,
-        normalMap: deskTextures.normalMap,
-        normalScale: new THREE.Vector2(0.36, 0.36),
-        roughnessMap: deskTextures.roughnessMap,
-        roughness: this.theme.materials.deskRoughness,
-        metalness: 0.0,
-        envMapIntensity: 0.14,
-      });
-      enhanceDeskShader(deskMat);
-      const deskMesh = new THREE.Mesh(deskGeo, deskMat);
-      deskMesh.receiveShadow = false;
-      this.scene.add(deskMesh);
-
-      // Soft radial contact shadow directly beneath the 16:9 book + isolated shadow-catching plane
-      const contactShadowCanvas = document.createElement('canvas');
-      contactShadowCanvas.width = 256;
-      contactShadowCanvas.height = 256;
-      const csCtx = contactShadowCanvas.getContext('2d')!;
-      const csGrad = csCtx.createRadialGradient(128, 128, 30, 128, 128, 124);
-      csGrad.addColorStop(0, 'rgba(0,0,0,0.58)');
-      csGrad.addColorStop(0.65, 'rgba(0,0,0,0.28)');
-      csGrad.addColorStop(1, 'rgba(0,0,0,0)');
-      csCtx.fillStyle = csGrad;
-      csCtx.fillRect(0, 0, 256, 256);
-      const contactShadowTex = new THREE.CanvasTexture(contactShadowCanvas);
-      const contactShadowGeo = new THREE.PlaneGeometry(2.82, 1.04);
-      contactShadowGeo.rotateX(-Math.PI / 2);
-      const contactShadowMat = new THREE.MeshBasicMaterial({
-        map: contactShadowTex,
-        transparent: true,
-        depthWrite: false,
-        opacity: 0.48,
-      });
-      const contactShadow = new THREE.Mesh(contactShadowGeo, contactShadowMat);
-      contactShadow.position.y = 0.001;
-      contactShadow.renderOrder = 1;
-      this.scene.add(contactShadow);
-
-      const bookShadowCatcherGeo = new THREE.PlaneGeometry(2.82, 1.12);
-      bookShadowCatcherGeo.rotateX(-Math.PI / 2);
-      const bookShadowCatcherMat = new THREE.ShadowMaterial({
-        color: 0x050302,
-        opacity: 0.54,
-        transparent: true,
-        depthWrite: false,
-      });
-      const bookShadowCatcher = new THREE.Mesh(bookShadowCatcherGeo, bookShadowCatcherMat);
-      bookShadowCatcher.position.y = 0.0016;
-      bookShadowCatcher.receiveShadow = true;
-      bookShadowCatcher.renderOrder = 2;
-      this.scene.add(bookShadowCatcher);
-
-      // Book rig & Props (book offset cleanly above its shadow-catching plane)
-      this.bookRig = createBookRig(this.theme, staticTextures, BOOK_TIMING.maxBatchSheets);
-      this.bookRig.group.position.y = 0.0036;
+      // Book rig sitting cleanly atop SURFACE_Y = 0 (shared seamlessly by Desk & Koi Pond environments)
+      this.bookRig = createBookRig(this.theme, this.staticTextures, BOOK_TIMING.maxBatchSheets);
+      this.bookRig.group.position.y = BookSceneController.SURFACE_Y + 0.0036;
       this.scene.add(this.bookRig.group);
 
-      this.propsRig = createDeskProps(staticTextures, this.theme.lighting.spotPosition);
-      this.syncPropsForViewport();
-      this.scene.add(this.propsRig.group);
+      // Instantiate switchable environments; initialize only the active one lazily (0% inactive GPU cost)
+      this.environments.set('desk', new DeskEnvironment(this.theme, this.staticTextures));
+      this.environments.set('pond', new PondEnvironment(this.theme, this.staticTextures));
+      const initialEnv = this.ensureEnvironmentInitialized(this.activeEnvId);
+      initialEnv?.setActive(true);
+      this.applyEnvironmentAtmosphere(this.activeEnvId);
 
       // Build current spread at reading scale upfront (eliminates CPU/GPU texture upload spikes on openBook)
       const contentsH = this.getOrCreatePageHandle(0, 'left');
@@ -702,8 +801,13 @@ export class BookSceneController {
       }
       this.invalidateShadows();
 
+      this.envStartMs = performance.now();
+      this.lastEnvUpdateMs = this.envStartMs;
       this.bindEvents();
       this.requestRender();
+      if (this.activeEnvId === 'pond' && !this.isDocumentHidden) {
+        this.startPondLoop();
+      }
       this.callbacks.onStateChange({ ...this.state });
       this.callbacks.onReady();
       this.scheduleIdlePreload(this.state.currentSpread);
@@ -711,15 +815,7 @@ export class BookSceneController {
       this.cleanupFns.push(() => {
         envRT.dispose();
         composerTarget.dispose();
-        deskTextures.dispose();
-        staticTextures.dispose();
-        deskGeo.dispose();
-        deskMat.dispose();
-        contactShadowTex.dispose();
-        contactShadowGeo.dispose();
-        contactShadowMat.dispose();
-        bookShadowCatcherGeo.dispose();
-        bookShadowCatcherMat.dispose();
+        this.staticTextures.dispose();
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'WebGL initialization failed';
@@ -745,6 +841,11 @@ export class BookSceneController {
       this.renderer.setSize(w, h);
       this.composer?.setSize(w, h);
       this.gradingPass?.uniforms.uResolution.value.set(w, h);
+      this.environments.forEach((env, envId) => {
+        if (this.initializedEnvs.has(envId)) {
+          env.onResize?.(w, h, this.renderer.getPixelRatio());
+        }
+      });
       this.syncPropsForViewport();
       this.syncPageSupersampling();
 
@@ -774,16 +875,31 @@ export class BookSceneController {
     window.addEventListener('pointermove', onWindowPointerMove, { passive: true });
 
     const onPointerDown = (e: PointerEvent) => {
-      if (e.button !== 0 || this.state.phase !== 'open' || this.disposed) return;
+      if (e.button !== 0 || this.disposed) return;
       this.updateNdcFromClient(e.clientX, e.clientY);
       this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+      const activeEnv = this.getActiveEnvironment();
+
+      if (this.state.phase === 'closed') {
+        const coverHits = this.raycaster.intersectObjects(this.bookRig.closedHitTargets, false);
+        if (coverHits.length === 0) {
+          activeEnv?.onPointerDown?.(this.raycaster, this.pointerNdc);
+        }
+        return;
+      }
+
+      if (this.state.phase !== 'open') return;
+
       const leftSurface =
         this.state.currentSpread === 0 ? this.bookRig.insideCoverSurface : this.bookRig.leftPageSurface;
       const hits = this.raycaster.intersectObjects(
         [leftSurface, this.bookRig.rightPageSurface],
         false,
       );
-      if (hits.length === 0) return;
+      if (hits.length === 0) {
+        activeEnv?.onPointerDown?.(this.raycaster, this.pointerNdc);
+        return;
+      }
 
       this.dragState = {
         active: false,
@@ -810,7 +926,8 @@ export class BookSceneController {
       }
       if (e.pointerType === 'touch' || this.activeTimeline?.isActive()) return;
       const now = performance.now();
-      if (now - this.lastRaycastMs < 40) return;
+      const throttleMs = this.activeEnvId === 'pond' ? 22 : 40;
+      if (now - this.lastRaycastMs < throttleMs) return;
       this.lastRaycastMs = now;
       this.handleHoverRaycast(e);
     };
@@ -827,6 +944,7 @@ export class BookSceneController {
       if (!this.dragState?.active) {
         this.clearHoverState();
       }
+      this.getActiveEnvironment()?.clearHover?.();
     };
     canvas.addEventListener('pointerleave', onPointerLeave);
 
@@ -843,8 +961,16 @@ export class BookSceneController {
       this.isDocumentHidden = document.hidden;
       if (this.isDocumentHidden) {
         this.stopPreviewLoop();
-      } else if (this.activePreviewSide) {
-        this.startPreviewLoop(this.activePreviewSide);
+        this.stopPondLoop();
+      } else {
+        if (this.activePreviewSide) {
+          this.startPreviewLoop(this.activePreviewSide);
+        }
+        if (this.activeEnvId === 'pond') {
+          this.lastEnvUpdateMs = performance.now();
+          this.startPondLoop();
+          this.requestRender();
+        }
       }
     };
     document.addEventListener('visibilitychange', onVisibility);
@@ -934,18 +1060,45 @@ export class BookSceneController {
     });
   }
 
+  private clearBookHoverOnly() {
+    if (this.hoveredCover) {
+      this.hoveredCover = false;
+      this.tweenCoverHoverLift(false);
+    }
+    if (this.hoveredContentsProjectId) {
+      const contentsHandle = this.pageHandles.get(this.getSlotKey(0, 'left'));
+      contentsHandle?.render(0, false, null);
+      this.hoveredContentsProjectId = null;
+    }
+    if (this.hoveredSide) {
+      this.restoreStaticPageTexture(this.hoveredSide);
+      this.hoveredSide = null;
+      this.callbacks.onHoverProject(null, null);
+    }
+    this.stopPreviewLoop();
+  }
+
   private handleHoverRaycast(e: PointerEvent) {
     if (this.disposed) return;
     this.updateNdcFromClient(e.clientX, e.clientY);
     this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+    const activeEnv = this.getActiveEnvironment();
 
     if (this.state.phase === 'closed') {
       const hits = this.raycaster.intersectObjects(this.bookRig.closedHitTargets, false);
       const isHover = hits.length > 0;
-      this.setCursorInteractive(isHover);
       if (isHover !== this.hoveredCover) {
         this.hoveredCover = isHover;
         this.tweenCoverHoverLift(isHover);
+      }
+      if (isHover) {
+        activeEnv?.clearHover?.();
+        this.setCursorInteractive(true);
+        return;
+      }
+      const envHandled = activeEnv?.onPointerMove?.(this.raycaster, this.pointerNdc) ?? false;
+      if (!envHandled) {
+        this.setCursorInteractive(false);
       }
       return;
     }
@@ -963,9 +1116,16 @@ export class BookSceneController {
     );
 
     if (hits.length === 0) {
-      this.clearHoverState();
+      this.clearBookHoverOnly();
+      const envHandled = activeEnv?.onPointerMove?.(this.raycaster, this.pointerNdc) ?? false;
+      if (!envHandled) {
+        this.setCursorInteractive(false);
+      }
+      this.requestRender();
       return;
     }
+
+    activeEnv?.clearHover?.();
 
     const hit = hits[0];
     const side: PageSide = hit.object === leftSurface ? 'left' : 'right';
@@ -1043,21 +1203,8 @@ export class BookSceneController {
 
   private clearHoverState() {
     this.setCursorInteractive(false);
-    if (this.hoveredCover) {
-      this.hoveredCover = false;
-      this.tweenCoverHoverLift(false);
-    }
-    if (this.hoveredContentsProjectId) {
-      const contentsHandle = this.pageHandles.get(this.getSlotKey(0, 'left'));
-      contentsHandle?.render(0, false, null);
-      this.hoveredContentsProjectId = null;
-    }
-    if (this.hoveredSide) {
-      this.restoreStaticPageTexture(this.hoveredSide);
-      this.hoveredSide = null;
-      this.callbacks.onHoverProject(null, null);
-    }
-    this.stopPreviewLoop();
+    this.clearBookHoverOnly();
+    this.getActiveEnvironment()?.clearHover?.();
     this.requestRender();
   }
 
@@ -1353,12 +1500,15 @@ export class BookSceneController {
     if (this.disposed || this.suppressNextClick) return;
     this.updateNdcFromClient(e.clientX, e.clientY);
     this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+    const activeEnv = this.getActiveEnvironment();
 
     if (this.state.phase === 'closed') {
       const hits = this.raycaster.intersectObjects(this.bookRig.closedHitTargets, false);
       if (hits.length > 0) {
         this.openBook();
+        return;
       }
+      activeEnv?.onPointerClick?.(this.raycaster, this.pointerNdc);
       return;
     }
 
@@ -1370,7 +1520,10 @@ export class BookSceneController {
       [leftSurface, this.bookRig.rightPageSurface],
       false,
     );
-    if (hits.length === 0) return;
+    if (hits.length === 0) {
+      activeEnv?.onPointerClick?.(this.raycaster, this.pointerNdc);
+      return;
+    }
 
     const hit = hits[0];
     const side: PageSide = hit.object === leftSurface ? 'left' : 'right';
@@ -1883,12 +2036,25 @@ export class BookSceneController {
       return;
     }
     this.renderBusy = true;
-    this.frameId = requestAnimationFrame(() => {
+    this.frameId = requestAnimationFrame((nowMs) => {
       if (this.disposed) return;
       this.renderDirty = false;
       if (this.dragState?.active && this.stepActiveDragSmoothing()) {
         this.renderDirty = true;
       }
+
+      const activeEnv = this.getActiveEnvironment();
+      if (activeEnv && this.initializedEnvs.has(this.activeEnvId)) {
+        const dtSec = Math.min(0.16, Math.max(0.001, (nowMs - this.lastEnvUpdateMs) / 1000));
+        this.lastEnvUpdateMs = nowMs;
+        const elapsedSec = (nowMs - this.envStartMs) / 1000;
+        activeEnv.update(dtSec, elapsedSec);
+        if (this.activeEnvId === 'pond') {
+          this.invalidateShadows();
+        }
+        activeEnv.onBeforeMainRender?.(this.renderer, this.scene, this.camera);
+      }
+
       this.updateBookShaderBounds();
       if (this.composer) {
         this.composer.render();
@@ -1897,8 +2063,11 @@ export class BookSceneController {
       }
       const done = () => {
         this.renderBusy = false;
-        if (this.renderDirty && !this.disposed) {
+        if (this.disposed) return;
+        if (this.renderDirty) {
           this.requestRender();
+        } else if (this.activeEnvId === 'pond' && !this.isDocumentHidden) {
+          this.startPondLoop();
         }
       };
       if (this.isSoftwareGl) {
@@ -1915,18 +2084,26 @@ export class BookSceneController {
     this.dragTween?.kill();
     this.activeTimeline?.kill();
     this.stopPreviewLoop();
+    this.stopPondLoop();
     cancelAnimationFrame(this.parallaxAnimId);
     clearTimeout(this.preloadQueueTimer);
     clearTimeout(this.dragTickId);
     cancelAnimationFrame(this.frameId);
     clearTimeout(this.frameId);
 
+    this.environments.forEach((env, envId) => {
+      if (this.initializedEnvs.has(envId)) {
+        env.dispose();
+      }
+    });
+    this.environments.clear();
+    this.initializedEnvs.clear();
+
     this.cleanupFns.forEach((fn) => fn());
     this.pageHandles.forEach((h) => h.dispose());
     this.pageHandles.clear();
 
     this.bookRig?.dispose();
-    this.propsRig?.dispose();
     this.composer?.dispose();
     this.renderer?.dispose();
     if (this.renderer?.domElement?.parentNode) {

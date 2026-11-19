@@ -15,6 +15,7 @@ export function ContactModal({ config, open, onClose }: ContactModalProps) {
   const [message, setMessage] = useState('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [copiedChannel, setCopiedChannel] = useState<string | null>(null);
   const [prepared, setPrepared] = useState(false);
 
   useEffect(() => {
@@ -48,6 +49,16 @@ export function ContactModal({ config, open, onClose }: ContactModalProps) {
       );
       const body = encodeURIComponent(message.trim());
       window.location.href = `mailto:${config.contact.email}?subject=${subject}&body=${body}`;
+    }
+  };
+
+  const handleCopyChannel = async (label: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedChannel(label);
+      setTimeout(() => setCopiedChannel((curr) => (curr === label ? null : curr)), 2000);
+    } catch {
+      setCopiedChannel(null);
     }
   };
 
@@ -104,24 +115,38 @@ export function ContactModal({ config, open, onClose }: ContactModalProps) {
         </div>
 
         <div className="space-y-5 p-6">
-          {/* Configured contact channels (no fabricated emails) */}
+          {/* Contact channels with direct links & copy-to-clipboard */}
           <div className="space-y-2.5 border-b border-white/10 pb-5 text-[13px]">
             {config.contact.channels.map((ch) => (
               <div key={ch.label} className="flex items-center justify-between gap-4">
                 <span className="text-[#958f83]">{ch.label}</span>
-                {ch.href ? (
-                  <a
-                    href={ch.href}
-                    target={ch.href.startsWith('http') ? '_blank' : undefined}
-                    rel={ch.href.startsWith('http') ? 'noopener noreferrer' : undefined}
-                    className="inline-flex items-center gap-1.5 font-medium text-[#f5d08a] underline-offset-4 hover:underline"
+                <div className="flex items-center gap-2">
+                  {ch.href ? (
+                    <a
+                      href={ch.href}
+                      target={ch.href.startsWith('http') ? '_blank' : undefined}
+                      rel={ch.href.startsWith('http') ? 'noopener noreferrer' : undefined}
+                      className="inline-flex items-center gap-1.5 font-medium text-[#f5d08a] underline-offset-4 hover:underline"
+                    >
+                      <span>{ch.value}</span>
+                      <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+                    </a>
+                  ) : (
+                    <span className="text-right text-[#b8b2a6]">{ch.value}</span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => handleCopyChannel(ch.label, ch.value)}
+                    aria-label={`Copy ${ch.label}`}
+                    className="inline-flex h-7 w-7 items-center justify-center rounded-sm border border-white/12 text-[#b8b2a6] transition-colors hover:bg-white/10 hover:text-white"
                   >
-                    <span>{ch.value}</span>
-                    <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
-                  </a>
-                ) : (
-                  <span className="text-right text-[#b8b2a6]">{ch.value}</span>
-                )}
+                    {copiedChannel === ch.label ? (
+                      <Check className="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" aria-hidden="true" />
+                    )}
+                  </button>
+                </div>
               </div>
             ))}
           </div>

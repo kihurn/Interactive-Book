@@ -14,6 +14,22 @@ import {
   type BookControllerState,
   type PageSide,
 } from './engine/bookState';
+import {
+  DEFAULT_ENVIRONMENT,
+  ENVIRONMENT_STORAGE_KEY,
+  type EnvironmentId,
+} from './scene/environments/types';
+
+function readInitialEnvironment(): EnvironmentId {
+  if (typeof window === 'undefined') return DEFAULT_ENVIRONMENT;
+  try {
+    const saved = window.localStorage.getItem(ENVIRONMENT_STORAGE_KEY);
+    if (saved === 'desk' || saved === 'pond') return saved;
+  } catch {
+    // Ignore storage read errors in restricted contexts
+  }
+  return DEFAULT_ENVIRONMENT;
+}
 
 export default function App() {
   const canvasMountRef = useRef<HTMLDivElement>(null);
@@ -41,9 +57,14 @@ export default function App() {
       : false,
   );
 
+  const [activeEnv, setActiveEnv] = useState<EnvironmentId>(readInitialEnvironment);
+  const [envSwitching, setEnvSwitching] = useState(false);
+  const envSwitchTimerRef = useRef<number>(0);
+
   const [hoveredProject, setHoveredProject] = useState<ProjectItem | null>(null);
   const [hoveredSide, setHoveredSide] = useState<PageSide | null>(null);
   const [cursorSceneInteractive, setCursorSceneInteractive] = useState(false);
+  const [cardHoverPos, setCardHoverPos] = useState<{ x: number; y: number } | null>(null);
   const [selectedProject, setSelectedProject] = useState<ProjectItem | null>(null);
   const [contactOpen, setContactOpen] = useState(false);
 
@@ -77,6 +98,22 @@ export default function App() {
     }
   }, []);
 
+  const handleChangeEnv = useCallback((nextEnv: EnvironmentId) => {
+    setActiveEnv(nextEnv);
+    setCardHoverPos(null);
+    try {
+      window.localStorage.setItem(ENVIRONMENT_STORAGE_KEY, nextEnv);
+    } catch {
+      // Ignore storage write errors
+    }
+    window.clearTimeout(envSwitchTimerRef.current);
+    setEnvSwitching(true);
+    controllerRef.current?.setEnvironment(nextEnv);
+    envSwitchTimerRef.current = window.setTimeout(() => {
+      setEnvSwitching(false);
+    }, 110);
+  }, []);
+
   const callbacksRef = useRef({
     onStateChange: (next: BookControllerState) => setBookState(next),
     onHoverProject: (proj: ProjectItem | null, side: PageSide | null) => {
@@ -85,6 +122,9 @@ export default function App() {
     },
     onCursorInteractiveChange: (interactive: boolean) =>
       setCursorSceneInteractive(interactive),
+    onCardHoverChange: (hovered: boolean, screenPos?: { x: number; y: number }) =>
+      setCardHoverPos(hovered && screenPos ? screenPos : null),
+    onOpenContact: () => handleOpenContact(),
     onSelectProject: (proj: ProjectItem) => handleOpenProjectModal(proj, null),
     onWebGLFailed: (reason: string) => setWebglError(reason),
     onReady: () => setSceneReady(true),
@@ -122,15 +162,19 @@ export default function App() {
         onHoverProject: (p, side) => callbacksRef.current.onHoverProject(p, side),
         onCursorInteractiveChange: (active) =>
           callbacksRef.current.onCursorInteractiveChange(active),
+        onCardHoverChange: (hovered, pos) =>
+          callbacksRef.current.onCardHoverChange(hovered, pos),
+        onOpenContact: () => callbacksRef.current.onOpenContact(),
         onSelectProject: (p) => callbacksRef.current.onSelectProject(p),
         onWebGLFailed: (r) => callbacksRef.current.onWebGLFailed(r),
         onReady: () => callbacksRef.current.onReady(),
       },
-      { autostart, reducedMotion },
+      { autostart, reducedMotion, initialEnvironment: activeEnv },
     );
     controllerRef.current = controller;
 
     return () => {
+      window.clearTimeout(envSwitchTimerRef.current);
       controller.dispose();
       controllerRef.current = null;
     };
@@ -188,9 +232,12 @@ export default function App() {
       data-book-state={bookState.phase}
       data-spread={bookState.currentSpread}
       data-mobile-side={bookState.mobileSide}
+      data-environment={activeEnv}
     >
       <Header
         config={SITE_CONFIG}
+        activeEnv={activeEnv}
+        onChangeEnv={handleChangeEnv}
         onOpenContact={handleOpenContact}
         onResetToStart={() => {
           if (bookState.phase === 'open') {
@@ -215,6 +262,28 @@ export default function App() {
             className="h-full w-full"
           />
 
+          {/* Brief soft veil on environment switch so shader/FBO warmup never flickers */}
+          <div
+            aria-hidden="true"
+            className={`pointer-events-none fixed inset-0 z-10 bg-[#070a0b] transition-opacity duration-150 ${
+              envSwitching ? 'opacity-35' : 'opacity-0'
+            }`}
+          />
+
+          {/* Minimal Contact pill shown gently above hovered Business Card */}
+          {cardHoverPos && !contactOpen && !selectedProject && (
+            <div
+              data-testid="card-contact-pill"
+              style={{
+                left: `${Math.round(cardHoverPos.x)}px`,
+                top: `${Math.round(cardHoverPos.y - 26)}px`,
+              }}
+              className="pointer-events-none fixed z-20 -translate-x-1/2 -translate-y-full rounded-full border border-white/18 bg-[#121110]/92 px-3 py-1 text-[11px] font-medium tracking-wide text-[#f5f2eb] shadow-lg"
+            >
+              Contact
+            </div>
+          )}
+
           {/* Loading curtain until first WebGL frame */}
           {!sceneReady && (
             <div
@@ -224,7 +293,9 @@ export default function App() {
             >
               <div className="h-6 w-6 animate-spin rounded-full border-2 border-white/20 border-t-[#e6b873]" />
               <p className="mt-4 text-[13px] tracking-wide text-[#a8a194]">
-                Preparing desk & portfolio spreads...
+                {activeEnv === 'pond'
+                  ? 'Preparing koi pond & portfolio spreads...'
+                  : 'Preparing desk & portfolio spreads...'}
               </p>
             </div>
           )}

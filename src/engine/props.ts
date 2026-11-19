@@ -9,14 +9,86 @@ import {
 } from './foliage';
 import type { BookStaticTextureSet } from './textures';
 
+export interface BusinessCardStackHandle {
+  group: THREE.Group;
+  cardsMeshGroup: THREE.Group;
+  hitTargets: THREE.Object3D[];
+  dispose: () => void;
+}
+
 export interface DeskPropsRig {
   group: THREE.Group;
   succulent: THREE.Group;
   pencil: THREE.Group;
   coffee: THREE.Group;
   cards: THREE.Group;
+  cardsMeshGroup: THREE.Group;
+  cardHitTargets: THREE.Object3D[];
   applyLayout: (layout: SceneTheme['props']['desktop']) => void;
   dispose: () => void;
+}
+
+export function createBusinessCardStack(
+  businessCardMap: THREE.CanvasTexture,
+): BusinessCardStackHandle {
+  const disposables: Array<{ dispose: () => void }> = [];
+  const group = new THREE.Group();
+  const cardsMeshGroup = new THREE.Group();
+  cardsMeshGroup.position.y = 0.003;
+  group.add(cardsMeshGroup);
+
+  const cardGeo = new THREE.BoxGeometry(0.28, 0.004, 0.165);
+  const cardTopMat = new THREE.MeshStandardMaterial({
+    map: businessCardMap,
+    roughness: 0.72,
+    metalness: 0.03,
+    envMapIntensity: 0.28,
+  });
+  const cardEdgeMat = new THREE.MeshStandardMaterial({
+    color: 0x262529,
+    roughness: 0.84,
+    metalness: 0.02,
+    envMapIntensity: 0.2,
+  });
+  const cardMaterials = [
+    cardEdgeMat,
+    cardEdgeMat,
+    cardTopMat,
+    cardEdgeMat,
+    cardEdgeMat,
+    cardEdgeMat,
+  ];
+  const cardLightMat = new THREE.MeshStandardMaterial({
+    color: 0xe6e1d7,
+    roughness: 0.84,
+    metalness: 0.01,
+    envMapIntensity: 0.18,
+  });
+
+  const cardBottom = new THREE.Mesh(cardGeo, cardLightMat);
+  cardBottom.position.set(-0.028, 0.002, 0.02);
+  cardBottom.rotation.y = -0.32;
+  cardBottom.castShadow = true;
+  cardBottom.receiveShadow = true;
+  cardBottom.name = 'business-card-bottom';
+  cardsMeshGroup.add(cardBottom);
+
+  const cardTop = new THREE.Mesh(cardGeo, cardMaterials);
+  cardTop.position.set(0.022, 0.007, -0.012);
+  cardTop.rotation.y = 0.2;
+  cardTop.castShadow = true;
+  cardTop.receiveShadow = true;
+  cardTop.name = 'business-card-top';
+  cardsMeshGroup.add(cardTop);
+
+  disposables.push(cardGeo, cardTopMat, cardEdgeMat, cardLightMat);
+
+  return {
+    group,
+    cardsMeshGroup,
+    hitTargets: [cardTop, cardBottom],
+    dispose: () => disposables.forEach((d) => d.dispose()),
+  };
 }
 
 function applyPropPlacement(obj: THREE.Object3D, placement: PropLayout) {
@@ -862,56 +934,11 @@ export function createDeskProps(
   );
 
   // 4. TWO OFFSET BUSINESS CARDS (lower-right)
-  const cards = new THREE.Group();
+  const cardStack = createBusinessCardStack(staticTextures.businessCardMap);
+  const cards = cardStack.group;
   addRectShadowCatcher(cards, 0.4, 0.28, 0.01, 0.008);
-  const cardsMeshGroup = new THREE.Group();
-  cardsMeshGroup.position.y = 0.003;
-  cards.add(cardsMeshGroup);
-
-  const cardGeo = new THREE.BoxGeometry(0.28, 0.004, 0.165);
-  const cardTopMat = new THREE.MeshStandardMaterial({
-    map: staticTextures.businessCardMap,
-    roughness: 0.72,
-    metalness: 0.03,
-    envMapIntensity: 0.28,
-  });
-  const cardEdgeMat = new THREE.MeshStandardMaterial({
-    color: 0x262529,
-    roughness: 0.84,
-    metalness: 0.02,
-    envMapIntensity: 0.2,
-  });
-  const cardMaterials = [
-    cardEdgeMat,
-    cardEdgeMat,
-    cardTopMat,
-    cardEdgeMat,
-    cardEdgeMat,
-    cardEdgeMat,
-  ];
-  const cardLightMat = new THREE.MeshStandardMaterial({
-    color: 0xe6e1d7,
-    roughness: 0.84,
-    metalness: 0.01,
-    envMapIntensity: 0.18,
-  });
-
-  const cardBottom = new THREE.Mesh(cardGeo, cardLightMat);
-  cardBottom.position.set(-0.028, 0.002, 0.02);
-  cardBottom.rotation.y = -0.32;
-  cardBottom.castShadow = true;
-  cardBottom.receiveShadow = true;
-  cardsMeshGroup.add(cardBottom);
-
-  const cardTop = new THREE.Mesh(cardGeo, cardMaterials);
-  cardTop.position.set(0.022, 0.007, -0.012);
-  cardTop.rotation.y = 0.2;
-  cardTop.castShadow = true;
-  cardTop.receiveShadow = true;
-  cardsMeshGroup.add(cardTop);
-
   root.add(cards);
-  disposables.push(cardGeo, cardTopMat, cardEdgeMat, cardLightMat);
+  disposables.push(cardStack);
 
   const updateDirectionalShadows = (layout: SceneTheme['props']['desktop']) => {
     const syncOffset = (
@@ -991,6 +1018,8 @@ export function createDeskProps(
     pencil,
     coffee,
     cards,
+    cardsMeshGroup: cardStack.cardsMeshGroup,
+    cardHitTargets: cardStack.hitTargets,
     applyLayout: (layout) => {
       applyPropPlacement(succulent, layout.succulent);
       applyPropPlacement(pencil, layout.pencil);
