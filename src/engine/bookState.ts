@@ -275,7 +275,9 @@ export function deformPageVertex(
   leftStackY: number,
   rightStackY: number,
   liftBias = 0,
+  out?: DeformedVertex,
 ): DeformedVertex {
+  const res = out ?? { x: 0, y: 0, z: 0 };
   const p = Math.max(0, Math.min(1, progress));
   const clampedU = Math.max(0, Math.min(1, u));
   const clampedV = Math.max(0, Math.min(1, v));
@@ -284,18 +286,16 @@ export function deformPageVertex(
   const restingY = rightStackY * (1 - p) + leftStackY * p;
 
   if (p <= 0.0001) {
-    return {
-      x: clampedU * pageWidth,
-      y: rightStackY,
-      z: (0.5 - clampedV) * pageHeight,
-    };
+    res.x = clampedU * pageWidth;
+    res.y = rightStackY;
+    res.z = (0.5 - clampedV) * pageHeight;
+    return res;
   }
   if (p >= 0.9999) {
-    return {
-      x: -clampedU * pageWidth,
-      y: leftStackY,
-      z: (0.5 - clampedV) * pageHeight,
-    };
+    res.x = -clampedU * pageWidth;
+    res.y = leftStackY;
+    res.z = (0.5 - clampedV) * pageHeight;
+    return res;
   }
 
   // Quintic S-curve for smooth acceleration and soft landing settle
@@ -332,10 +332,11 @@ export function deformPageVertex(
   const spineArch = (0.048 + liftBias * 0.03) * bell * uWave;
   const subtleZFlutter = 0.008 * bell * Math.sin(Math.PI * clampedU) * (clampedV - 0.5);
 
-  const y = safeBaseY + arcY * 0.85 + spineArch;
-  const z = (0.5 - clampedV) * pageHeight + subtleZFlutter;
+  res.x = x;
+  res.y = safeBaseY + arcY * 0.85 + spineArch;
+  res.z = (0.5 - clampedV) * pageHeight + subtleZFlutter;
 
-  return { x, y, z };
+  return res;
 }
 
 export interface CursorCameraOffset {

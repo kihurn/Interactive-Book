@@ -1,5 +1,9 @@
 import * as THREE from 'three';
-import { nearestObstacleSeparation, POND_LAYOUT } from './constants';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { nearestObstacleSeparation, POND_BOUNDS, POND_LAYOUT } from './constants';
+import { POND_CAUSTICS_GLSL } from './causticsShader';
+
+const noopRaycast = () => {};
 import {
   createCreepingMossMatGeometry,
   createMossClumpTextures,
@@ -50,6 +54,44 @@ interface FloatingLeafAgent {
   driftPhase: number;
   driftAmpX: number;
   driftAmpZ: number;
+}
+
+export interface UnderwaterShoalStoneSpec {
+  x: number;
+  z: number;
+  yOffset: number;
+  radius: number;
+  height: number;
+  yaw: number;
+  seed: number;
+}
+
+export const RIGHT_UNDERWATER_SHOAL_STONES: readonly UnderwaterShoalStoneSpec[] = [
+  // Core foundation stones tucked beneath emergent cobbles
+  { x: 1.56, z: -0.44, yOffset: -0.25, radius: 0.27, height: 0.13, yaw: 0.95, seed: 11.4 },
+  { x: 1.84, z: -0.60, yOffset: -0.26, radius: 0.29, height: 0.14, yaw: -0.75, seed: 15.2 },
+  { x: 1.98, z: -0.28, yOffset: -0.25, radius: 0.24, height: 0.12, yaw: 1.45, seed: 19.8 },
+  { x: 1.42, z: -0.78, yOffset: -0.25, radius: 0.23, height: 0.115, yaw: -1.30, seed: 23.1 },
+  { x: 1.72, z: -0.26, yOffset: -0.28, radius: 0.24, height: 0.115, yaw: 0.30, seed: 27.6 },
+  // Broad stepped underwater river cobbles spreading evenly around the right pond bank
+  { x: 1.24, z: -0.68, yOffset: -0.28, radius: 0.28, height: 0.125, yaw: 0.55, seed: 31.4 },
+  { x: 1.20, z: -1.04, yOffset: -0.29, radius: 0.25, height: 0.115, yaw: -0.45, seed: 35.8 },
+  { x: 1.68, z: -1.08, yOffset: -0.28, radius: 0.31, height: 0.135, yaw: 1.15, seed: 39.2 },
+  { x: 2.02, z: -0.92, yOffset: -0.27, radius: 0.29, height: 0.13, yaw: -1.15, seed: 43.7 },
+  { x: 1.46, z: -1.24, yOffset: -0.31, radius: 0.24, height: 0.11, yaw: 2.05, seed: 47.1 },
+  { x: 2.24, z: -0.58, yOffset: -0.27, radius: 0.30, height: 0.13, yaw: 0.25, seed: 51.6 },
+  { x: 2.18, z: -0.02, yOffset: -0.28, radius: 0.28, height: 0.125, yaw: -0.65, seed: 55.9 },
+  { x: 1.86, z: 0.14, yOffset: -0.29, radius: 0.26, height: 0.115, yaw: 1.35, seed: 60.3 },
+];
+
+export function computeSubmergedStoneCenterY(
+  waterY: number,
+  bedY: number,
+  stone: Pick<UnderwaterShoalStoneSpec, 'yOffset' | 'radius' | 'height'>,
+): number {
+  const halfH = Math.max(stone.height * 1.06, stone.radius * 0.64);
+  const maxSubmergedCenterY = waterY - halfH * 1.08 - 0.055;
+  return Math.min(maxSubmergedCenterY, Math.max(bedY + halfH * 0.45, waterY + stone.yOffset));
 }
 
 function hash3(x: number, y: number, z: number, seed: number): number {
@@ -116,25 +158,25 @@ export function createLilyPadTextures(maxAnisotropy: number): LilyPadTextures {
   const cy = size * 0.5;
   const maxR = size * 0.49;
 
-  // Rich deep botanical jade-olive lamina with subtle warm bronze-crimson outer rim blush
+  // Sunlit botanical olive-emerald lamina (#3f6c32 base) with subtle warm rim blush (~40% brighter than before)
   const radGrad = cCtx.createRadialGradient(cx, cy, 18, cx, cy, maxR);
-  radGrad.addColorStop(0, '#3e5e2b');
-  radGrad.addColorStop(0.28, '#324e23');
-  radGrad.addColorStop(0.68, '#263e1b');
-  radGrad.addColorStop(0.91, '#203517');
-  radGrad.addColorStop(0.97, '#423620');
-  radGrad.addColorStop(1, '#4c3221');
+  radGrad.addColorStop(0, '#52803c');
+  radGrad.addColorStop(0.28, '#477436');
+  radGrad.addColorStop(0.68, '#3f6c32');
+  radGrad.addColorStop(0.91, '#37602b');
+  radGrad.addColorStop(0.97, '#59562e');
+  radGrad.addColorStop(1, '#62472b');
   cCtx.fillStyle = radGrad;
   cCtx.fillRect(0, 0, size, size);
 
   bCtx.fillStyle = '#808080';
   bCtx.fillRect(0, 0, size, size);
 
-  // Hydrophobic waxy lamina cuticle (~0.40 roughness), slightly higher along veins/rim
+  // Satin waxy lamina cuticle (paired with material roughness 0.62 -> ~0.58-0.63 effective roughness)
   const roughGrad = rCtx.createRadialGradient(cx, cy, 24, cx, cy, maxR);
-  roughGrad.addColorStop(0, '#626262');
-  roughGrad.addColorStop(0.75, '#6e6e6e');
-  roughGrad.addColorStop(1, '#949494');
+  roughGrad.addColorStop(0, '#e2e2e2');
+  roughGrad.addColorStop(0.75, '#ececec');
+  roughGrad.addColorStop(1, '#fafafa');
   rCtx.fillStyle = roughGrad;
   rCtx.fillRect(0, 0, size, size);
 
@@ -143,7 +185,7 @@ export function createLilyPadTextures(maxAnisotropy: number): LilyPadTextures {
     return v - Math.floor(v);
   };
 
-  // Subtle low-contrast organic chlorophyll depth mottling (no harsh chalky speckles)
+  // Subtle low-contrast organic chlorophyll depth mottling
   for (let i = 0; i < 420; i++) {
     const a = (i * 2.39996) % (Math.PI * 2);
     const r = Math.sqrt((i + 1) / 420) * (size * 0.465);
@@ -153,18 +195,18 @@ export function createLilyPadTextures(maxAnisotropy: number): LilyPadTextures {
     const pick = i % 4;
     cCtx.fillStyle =
       pick === 0
-        ? 'rgba(74, 108, 48, 0.065)'
+        ? 'rgba(98, 144, 68, 0.085)'
         : pick === 1
-          ? 'rgba(24, 42, 18, 0.07)'
+          ? 'rgba(42, 74, 32, 0.07)'
           : pick === 2
-            ? 'rgba(60, 90, 40, 0.055)'
-            : 'rgba(84, 72, 42, 0.045)';
+            ? 'rgba(88, 135, 66, 0.075)'
+            : 'rgba(116, 102, 54, 0.05)';
     cCtx.beginPath();
     cCtx.ellipse(px, py, rad * 1.25, rad * 0.88, a + 0.4, 0, Math.PI * 2);
     cCtx.fill();
   }
 
-  // Delicate dichotomous branching veins (soft chartreuse-jade, subtle natural contrast)
+  // Dichotomous branching veins (#588742 sunlit olive-emerald veins over #3f6c32 lamina)
   const drawBranchVein = (
     x0: number,
     y0: number,
@@ -182,12 +224,19 @@ export function createLilyPadTextures(maxAnisotropy: number): LilyPadTextures {
     const ex = x0 + Math.cos(angle + curveBend * 0.6) * len;
     const ey = y0 + Math.sin(angle + curveBend * 0.6) * len;
 
-    const alphaColor = depth === 0 ? 0.21 : depth === 1 ? 0.15 : 0.095;
+    const alphaColor = depth === 0 ? 0.64 : depth === 1 ? 0.48 : 0.32;
     const alphaBump = depth === 0 ? 0.24 : depth === 1 ? 0.18 : 0.11;
 
-    cCtx.strokeStyle = `rgba(116, 152, 74, ${alphaColor})`;
+    cCtx.strokeStyle = `rgba(88, 135, 66, ${alphaColor})`;
     cCtx.lineWidth = width;
     cCtx.lineCap = 'round';
+    cCtx.beginPath();
+    cCtx.moveTo(x0, y0);
+    cCtx.quadraticCurveTo(mx, my, ex, ey);
+    cCtx.stroke();
+
+    cCtx.strokeStyle = `rgba(114, 160, 84, ${alphaColor * 0.42})`;
+    cCtx.lineWidth = Math.max(0.8, width * 0.48);
     cCtx.beginPath();
     cCtx.moveTo(x0, y0);
     cCtx.quadraticCurveTo(mx, my, ex, ey);
@@ -201,7 +250,7 @@ export function createLilyPadTextures(maxAnisotropy: number): LilyPadTextures {
     bCtx.quadraticCurveTo(mx, my, ex, ey);
     bCtx.stroke();
 
-    rCtx.strokeStyle = `rgba(144, 144, 144, ${alphaBump * 0.85})`;
+    rCtx.strokeStyle = `rgba(248, 248, 248, ${alphaBump * 0.9})`;
     rCtx.lineWidth = width * 1.1;
     rCtx.beginPath();
     rCtx.moveTo(x0, y0);
@@ -234,14 +283,14 @@ export function createLilyPadTextures(maxAnisotropy: number): LilyPadTextures {
   const primaryVeins = 16;
   for (let i = 0; i < primaryVeins; i++) {
     const ang = (i / primaryVeins) * Math.PI * 2 + 0.12 + (hash(i + 5) - 0.5) * 0.08;
-    drawBranchVein(cx, cy, ang, size * 0.28, 2.1, 0, i + 1);
+    drawBranchVein(cx, cy, ang, size * 0.28, 2.2, 0, i + 1);
   }
 
-  // Faint bronze-crimson blush ring right along the wavy rim edge
+  // Faint warm bronze-russet blush ring right along the wavy rim edge
   const rimGlow = cCtx.createRadialGradient(cx, cy, maxR * 0.86, cx, cy, maxR);
-  rimGlow.addColorStop(0, 'rgba(98, 48, 32, 0)');
-  rimGlow.addColorStop(0.75, 'rgba(98, 48, 32, 0.12)');
-  rimGlow.addColorStop(1, 'rgba(104, 42, 30, 0.24)');
+  rimGlow.addColorStop(0, 'rgba(122, 68, 42, 0)');
+  rimGlow.addColorStop(0.75, 'rgba(122, 68, 42, 0.12)');
+  rimGlow.addColorStop(1, 'rgba(128, 58, 38, 0.22)');
   cCtx.fillStyle = rimGlow;
   cCtx.fillRect(0, 0, size, size);
 
@@ -378,20 +427,26 @@ export function createLilyPadDroplets(
     envMapIntensity: 1.35,
   });
 
-  placements.forEach((p) => {
+  const dropsInst = new THREE.InstancedMesh(geo, mat, placements.length);
+  dropsInst.castShadow = false;
+  dropsInst.receiveShadow = true;
+  dropsInst.raycast = noopRaycast;
+  const dummy = new THREE.Object3D();
+
+  placements.forEach((p, idx) => {
     const r = p.rNorm * padOpts.radius;
     const x = Math.cos(p.theta) * r;
     const z = Math.sin(p.theta) * r;
     const y = sampleLilyPadSurfaceY(p.rNorm, p.theta, padOpts) + 0.002 * p.scale;
 
-    const bead = new THREE.Mesh(geo, mat);
-    bead.position.set(x, y, z);
-    bead.scale.setScalar(p.scale);
-    bead.rotation.y = p.theta * 1.3;
-    bead.castShadow = false;
-    bead.receiveShadow = true;
-    group.add(bead);
+    dummy.position.set(x, y, z);
+    dummy.scale.setScalar(p.scale);
+    dummy.rotation.set(0, p.theta * 1.3, 0);
+    dummy.updateMatrix();
+    dropsInst.setMatrixAt(idx, dummy.matrix);
   });
+  dropsInst.instanceMatrix.needsUpdate = true;
+  group.add(dropsInst);
 
   return {
     group,
@@ -410,23 +465,25 @@ function createLotusPetalTexture(maxAnisotropy: number): THREE.CanvasTexture {
   const ctx = canvas.getContext('2d')!;
 
   const vGrad = ctx.createLinearGradient(0, size, 0, 0);
-  vGrad.addColorStop(0, '#fff7dc'); // warm creamy nectar ivory base
-  vGrad.addColorStop(0.32, '#fff5f0'); // luminous soft ivory-blush
-  vGrad.addColorStop(0.68, '#f6bfd3'); // soft lotus-pink wash
-  vGrad.addColorStop(1, '#dd6893'); // warm rose-blush upper apex
+  vGrad.addColorStop(0, '#8f3858'); // deep rose-plum shadow tucked into petal base
+  vGrad.addColorStop(0.22, '#c96a8b'); // warm rose transition
+  vGrad.addColorStop(0.38, '#fff8e6'); // luminous cream-ivory mid-lower belly
+  vGrad.addColorStop(0.58, '#fff2f4'); // soft luminous ivory-blush mid-petal
+  vGrad.addColorStop(0.78, '#ef9cb9'); // delicate lotus-pink wash
+  vGrad.addColorStop(1, '#cf4b7c'); // rich rose-blush upper apex
   ctx.fillStyle = vGrad;
   ctx.fillRect(0, 0, size, size);
 
   // Delicate longitudinal botanical petal veins fanning across the broad obovate belly
-  const ribCount = 30;
+  const ribCount = 34;
   for (let i = 0; i < ribCount; i++) {
     const u = (i + 0.5) / ribCount;
     const s = u * 2 - 1;
-    const xBase = size * (0.5 + s * 0.18);
+    const xBase = size * (0.5 + s * 0.16);
     const xMid = size * (0.5 + s * 0.49);
-    const xTip = size * (0.5 + s * 0.22);
+    const xTip = size * (0.5 + s * 0.21);
     ctx.strokeStyle =
-      i % 2 === 0 ? 'rgba(255, 250, 244, 0.34)' : 'rgba(214, 96, 138, 0.16)';
+      i % 2 === 0 ? 'rgba(255, 250, 244, 0.38)' : 'rgba(186, 62, 108, 0.22)';
     ctx.lineWidth = i === ribCount / 2 ? 2.2 : 1.3;
     ctx.beginPath();
     ctx.moveTo(xBase, size);
@@ -454,12 +511,13 @@ function createLotusPetalGeometry(
   const segV = 22;
   const positions: number[] = [];
   const colors: number[] = [];
+  const aoAttr: number[] = [];
   const uvs: number[] = [];
   const indices: number[] = [];
 
-  const baseColor = new THREE.Color('#fff9e2');
-  const midColor = new THREE.Color('#fce6ef');
-  const tipColor = new THREE.Color('#e37099');
+  const baseColor = new THREE.Color('#b55978');
+  const midColor = new THREE.Color('#fff8ea');
+  const tipColor = new THREE.Color('#df5889');
   const tmpColor = new THREE.Color();
 
   for (let iv = 0; iv <= segV; iv++) {
@@ -488,10 +546,17 @@ function createLotusPetalGeometry(
       positions.push(x, y, zLen);
       uvs.push(u, v);
 
-      if (v < 0.44) {
-        tmpColor.copy(baseColor).lerp(midColor, v / 0.44);
+      // Deep smooth inner-cup Ambient Occlusion: 0.38 in tucked lower 35% rising smoothly to 1.0 at sunlit bellies & tips
+      const vRise = Math.min(1, Math.max(0, (v - 0.10) / 0.38));
+      const smoothV = vRise * vRise * (3 - 2 * vRise);
+      const marginLift = Math.pow(Math.abs(s), 1.6) * 0.08 * (1 - smoothV);
+      const petalAo = Math.min(1, 0.38 + 0.62 * smoothV + marginLift);
+      aoAttr.push(petalAo);
+
+      if (v < 0.36) {
+        tmpColor.copy(baseColor).lerp(midColor, v / 0.36);
       } else {
-        tmpColor.copy(midColor).lerp(tipColor, Math.pow((v - 0.44) / 0.56, 1.08));
+        tmpColor.copy(midColor).lerp(tipColor, Math.pow((v - 0.36) / 0.64, 1.08));
       }
       colors.push(tmpColor.r, tmpColor.g, tmpColor.b);
     }
@@ -511,6 +576,7 @@ function createLotusPetalGeometry(
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geo.setAttribute('aPetalAo', new THREE.Float32BufferAttribute(aoAttr, 1));
   geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
   geo.setIndex(indices);
   geo.computeVertexNormals();
@@ -539,8 +605,8 @@ function createGraniteBoulderTextures(maxAnisotropy: number): {
   rCanvas.height = size;
   const rCtx = rCanvas.getContext('2d')!;
 
-  // Matte weathered natural dark-grey granite base (#444a48)
-  cCtx.fillStyle = '#444a48';
+  // Matte weathered natural medium river-granite base (#525855) matching natural mossy pond stones
+  cCtx.fillStyle = '#525855';
   cCtx.fillRect(0, 0, size, size);
 
   bCtx.fillStyle = '#808080';
@@ -644,56 +710,56 @@ function createGraniteBoulderTextures(maxAnisotropy: number): {
   };
 }
 
+function evaluateGraniteBoulderVertex(
+  dir: THREE.Vector3,
+  radius: number,
+  aboveWater: number,
+  seed: number,
+  out: THREE.Vector3,
+): THREE.Vector3 {
+  const n1 = fbm3D(dir.x * 1.25 + 1.8, dir.y * 1.25 + 1.8, dir.z * 1.25 + 1.8, seed);
+  const n2 = fbm3D(dir.x * 2.3 + 4.2, dir.y * 2.3 + 2.7, dir.z * 2.3 + 3.4, seed + 13);
+
+  // Soft, smooth river-cobble silhouette with gentle low-frequency curvature
+  const rMod = 0.90 + (n1 - 0.5) * 0.20 + (n2 - 0.5) * 0.07;
+
+  // Plump oval / domed proportions per boulder matching rounded river cobbles (curves inward underneath too)
+  const isCenterDome = seed < 2.0;
+  const isBottomOval = seed >= 2.0 && seed < 6.0;
+  const asymX = isBottomOval ? 1.26 : isCenterDome ? 1.12 : 1.08;
+  const asymZ = isBottomOval ? 0.86 : isCenterDome ? 1.00 : 0.95;
+  const crownBias =
+    1.0 + (dir.x * Math.cos(seed * 1.9) + dir.z * Math.sin(seed * 1.9)) * 0.06;
+
+  // True roundish 3D river stone (top & bottom curve naturally inward — zero cylindrical column skirt)
+  const baseHalfH = Math.max(aboveWater * 1.06, radius * 0.64);
+  const underFlatten = dir.y < 0 ? 0.92 : 1.0;
+
+  const px = dir.x * rMod * radius * asymX;
+  const pz = dir.z * rMod * radius * asymZ;
+  const py = dir.y * rMod * crownBias * baseHalfH * underFlatten;
+
+  return out.set(px, py, pz);
+}
+
 /**
- * Sculpts a substantial angular & river-worn granite boulder with multi-octave FBM + planar
- * fracture bevels, protruding half above waterY and half submerged below waterY.
+ * Sculpts a genuine roundish 3D river-cobble boulder from IcosahedronGeometry(1, 3),
+ * curving naturally inward below the waterline (supported by nestled stones underneath).
  */
 function createGraniteBoulderGeometry(
   radius: number,
   aboveWater: number,
-  belowWater: number,
   seed: number,
 ): THREE.BufferGeometry {
-  const geo = new THREE.IcosahedronGeometry(1, 4);
+  const geo = new THREE.IcosahedronGeometry(1, 3);
   const pos = geo.attributes.position as THREE.BufferAttribute;
 
-  // Define 5 pseudo-random cleavage planes for gentle river-worn rock facets
-  const planes = Array.from({ length: 5 }, (_, k) => {
-    const a = k * 2.1 + seed * 1.7;
-    const elev = 0.25 + ((k * 0.37) % 0.65);
-    return new THREE.Vector3(
-      Math.cos(a) * Math.cos(elev),
-      Math.sin(elev),
-      Math.sin(a) * Math.cos(elev),
-    ).normalize();
-  });
-
   const v = new THREE.Vector3();
+  const out = new THREE.Vector3();
   for (let i = 0; i < pos.count; i++) {
     v.set(pos.getX(i), pos.getY(i), pos.getZ(i)).normalize();
-
-    // Smooth FBM displacement + gentle river-worn rock facets
-    const n1 = fbm3D(v.x * 1.85 + 2.0, v.y * 1.85 + 2.0, v.z * 1.85 + 2.0, seed);
-    let rMod = 0.86 + n1 * 0.28;
-
-    for (let p = 0; p < planes.length; p++) {
-      const dot = v.dot(planes[p]);
-      if (dot > 0.52) {
-        rMod -= (dot - 0.52) * 0.19;
-      }
-    }
-
-    // Subtle river-worn flat upper shelf so dappled bamboo shadows read clearly across the stone top
-    let py = v.y * rMod;
-    if (py > 0.46) {
-      py = 0.46 + (py - 0.46) * 0.36;
-    }
-
-    const px = v.x * rMod * radius * 1.08;
-    const pz = v.z * rMod * radius * 0.92;
-    const scaledY = py >= 0 ? py * aboveWater * 1.38 : py * belowWater * 1.38;
-
-    pos.setXYZ(i, px, scaledY, pz);
+    evaluateGraniteBoulderVertex(v, radius, aboveWater, seed, out);
+    pos.setXYZ(i, out.x, out.y, out.z);
   }
 
   geo.computeVertexNormals();
@@ -1022,11 +1088,14 @@ export function createPondFlora(
     bumpMap: padTextures.bumpMap,
     bumpScale: 0.0038,
     roughnessMap: padTextures.roughnessMap,
-    roughness: 0.42,
+    roughness: 0.62,
     metalness: 0.0,
-    clearcoat: 0.35,
-    clearcoatRoughness: 0.32,
-    envMapIntensity: 0.24,
+    clearcoat: 0.06,
+    clearcoatRoughness: 0.56,
+    sheen: 0.3,
+    sheenRoughness: 0.72,
+    sheenColor: new THREE.Color('#7aa658'),
+    envMapIntensity: 0.22,
     side: THREE.DoubleSide,
   });
 
@@ -1050,6 +1119,7 @@ export function createPondFlora(
   const mainMeniscus = new THREE.Mesh(mainMeniscusGeo, meniscusMat);
   mainMeniscus.position.y = -0.0024;
   mainMeniscus.renderOrder = 2;
+  mainMeniscus.raycast = noopRaycast;
   lotusGroup.add(mainMeniscus);
 
   const mainPadOpts: LilyPadSculptOptions = {
@@ -1086,6 +1156,7 @@ export function createPondFlora(
   const compMeniscus = new THREE.Mesh(compMeniscusGeo, meniscusMat);
   compMeniscus.position.y = -0.002;
   compMeniscus.renderOrder = 2;
+  compMeniscus.raycast = noopRaycast;
   compGroup.add(compMeniscus);
 
   const compPadOpts: LilyPadSculptOptions = {
@@ -1114,93 +1185,183 @@ export function createPondFlora(
   flowerRoot.position.set(0.035, 0.008, -0.025);
   lotusGroup.add(flowerRoot);
 
-  // Classic flat-topped inverted-cone golden-yellow lotus seed pod receptacle + dimpled carpel sockets
-  const podProfile = [
-    new THREE.Vector2(0, 0),
-    new THREE.Vector2(0.011, 0.003),
-    new THREE.Vector2(0.021, 0.017),
-    new THREE.Vector2(0.030, 0.033),
-    new THREE.Vector2(0.0285, 0.0365),
-    new THREE.Vector2(0, 0.0355),
+  // Sculpted flat-topped golden-yellow lotus seed pod with recessed dark carpel dimples
+  const podSegRadial = 32;
+  const podSegRings = 16;
+  const podHeight = 0.038;
+  const podTopR = 0.025;
+  const podBaseR = 0.0085;
+  const pitPositions: Array<[number, number]> = [
+    [0, 0],
+    ...Array.from({ length: 5 }, (_, k): [number, number] => {
+      const a = (k / 5) * Math.PI * 2 + 0.25;
+      return [Math.cos(a) * 0.0092, Math.sin(a) * 0.0092];
+    }),
+    ...Array.from({ length: 7 }, (_, k): [number, number] => {
+      const a = (k / 7) * Math.PI * 2 + 0.55;
+      return [Math.cos(a) * 0.0178, Math.sin(a) * 0.0178];
+    }),
   ];
-  const podGeo = new THREE.LatheGeometry(podProfile, 28);
+
+  // Build unified pod mesh: flared inverted cone + high-res top cap with 3D recessed dimples
+  const podPositions: number[] = [];
+  const podColors: number[] = [];
+  const podIndices: number[] = [];
+  const podGold = new THREE.Color('#efd34c');
+  const podRimGold = new THREE.Color('#d4ac2e');
+  const podDimpleDark = new THREE.Color('#4a2b09');
+  const podTmpColor = new THREE.Color();
+
+  // Side chalice rings (rows 0..6) + top cap concentric rings (rows 7..podSegRings)
+  const sideRings = 6;
+  const topRings = podSegRings - sideRings;
+  for (let ir = 0; ir <= podSegRings; ir++) {
+    let r = 0;
+    let y = 0;
+    const isTop = ir > sideRings;
+    if (!isTop) {
+      const t = ir / sideRings;
+      r = THREE.MathUtils.lerp(podBaseR, podTopR, Math.pow(t, 0.86));
+      y = t * podHeight;
+    } else {
+      const t = (ir - sideRings) / topRings; // 0 (outer rim) -> 1 (center)
+      r = podTopR * (1 - t);
+      y = podHeight - 0.0012 * Math.sin(t * Math.PI * 0.5) + (t < 0.14 ? 0.0008 : 0);
+    }
+
+    for (let ia = 0; ia <= podSegRadial; ia++) {
+      const ang = (ia / podSegRadial) * Math.PI * 2;
+      const vx = Math.cos(ang) * r;
+      const vz = Math.sin(ang) * r;
+      let vy = y;
+      podTmpColor.copy(isTop ? podGold : podRimGold);
+
+      if (isTop) {
+        let minPitT = 1.0;
+        for (let p = 0; p < pitPositions.length; p++) {
+          const d = Math.hypot(vx - pitPositions[p][0], vz - pitPositions[p][1]);
+          const pitT = Math.min(1, d / 0.0034);
+          if (pitT < minPitT) minPitT = pitT;
+        }
+        // True concave depression recessed into the golden receptacle top
+        const recessDepth = Math.pow(1 - minPitT, 1.55) * 0.0036;
+        vy -= recessDepth;
+        podTmpColor.lerp(podDimpleDark, Math.pow(1 - minPitT, 1.35) * 0.92);
+      }
+
+      podPositions.push(vx, vy, vz);
+      podColors.push(podTmpColor.r, podTmpColor.g, podTmpColor.b);
+    }
+  }
+
+  const podCols = podSegRadial + 1;
+  for (let ir = 0; ir < podSegRings; ir++) {
+    for (let ia = 0; ia < podSegRadial; ia++) {
+      const a = ir * podCols + ia;
+      const b = a + 1;
+      const c = a + podCols;
+      const d = c + 1;
+      podIndices.push(a, b, d, a, d, c);
+    }
+  }
+
+  const podGeo = new THREE.BufferGeometry();
+  podGeo.setAttribute('position', new THREE.Float32BufferAttribute(podPositions, 3));
+  podGeo.setAttribute('color', new THREE.Float32BufferAttribute(podColors, 3));
+  podGeo.setIndex(podIndices);
+  podGeo.computeVertexNormals();
+
   const podMat = new THREE.MeshStandardMaterial({
-    color: 0xebd04a,
-    roughness: 0.54,
+    color: 0xffffff,
+    vertexColors: true,
+    roughness: 0.56,
     metalness: 0.04,
-    envMapIntensity: 0.26,
+    envMapIntensity: 0.24,
   });
   const podMesh = new THREE.Mesh(podGeo, podMat);
   podMesh.castShadow = true;
   podMesh.receiveShadow = true;
   flowerRoot.add(podMesh);
 
-  const pitGeo = new THREE.CylinderGeometry(0.0031, 0.0022, 0.0036, 10);
+  // Tiny dark carpel seeds nestled deeply inside the recessed sockets (well below the golden top rim)
+  const pitGeo = new THREE.SphereGeometry(0.0021, 8, 6);
+  pitGeo.scale(1.0, 0.55, 1.0);
   const pitMat = new THREE.MeshStandardMaterial({
-    color: 0x6b4714,
-    roughness: 0.82,
+    color: 0x3b2207,
+    roughness: 0.88,
   });
-  const pitPositions: Array<[number, number]> = [
-    [0, 0],
-    ...Array.from({ length: 5 }, (_, k): [number, number] => {
-      const a = (k / 5) * Math.PI * 2 + 0.25;
-      return [Math.cos(a) * 0.0105, Math.sin(a) * 0.0105];
-    }),
-    ...Array.from({ length: 7 }, (_, k): [number, number] => {
-      const a = (k / 7) * Math.PI * 2 + 0.55;
-      return [Math.cos(a) * 0.0205, Math.sin(a) * 0.0205];
-    }),
-  ];
-  pitPositions.forEach(([px, pz]) => {
-    const pitMesh = new THREE.Mesh(pitGeo, pitMat);
-    pitMesh.position.set(px, 0.0348, pz);
-    flowerRoot.add(pitMesh);
+  const pitInst = new THREE.InstancedMesh(pitGeo, pitMat, pitPositions.length);
+  pitInst.receiveShadow = true;
+  pitInst.raycast = noopRaycast;
+  const lotusDummy = new THREE.Object3D();
+  pitPositions.forEach(([px, pz], idx) => {
+    lotusDummy.position.set(px, podHeight - 0.0028, pz);
+    lotusDummy.rotation.set(0, 0, 0);
+    lotusDummy.scale.set(1, 1, 1);
+    lotusDummy.updateMatrix();
+    pitInst.setMatrixAt(idx, lotusDummy.matrix);
   });
+  pitInst.instanceMatrix.needsUpdate = true;
+  flowerRoot.add(pitInst);
 
-  // Delicate crown of 36 slender golden stamens curving gently upward around the pod's base
-  const filamentGeo = new THREE.CylinderGeometry(0.00085, 0.00115, 0.033, 5);
-  filamentGeo.translate(0, 0.0165, 0);
-  const antherGeo = new THREE.SphereGeometry(0.0023, 6, 5);
-  antherGeo.scale(0.85, 1.45, 0.85);
+  // Clearly visible crown of 40 golden stamens ringing the sleeker pod collar
+  const filamentGeo = new THREE.CylinderGeometry(0.0012, 0.0015, 0.036, 5);
+  filamentGeo.translate(0, 0.018, 0);
+  const antherGeo = new THREE.SphereGeometry(0.0025, 6, 5);
+  antherGeo.scale(0.9, 1.48, 0.9);
   const stamenMat = new THREE.MeshStandardMaterial({
-    color: 0xfde276,
-    emissive: 0x4c3004,
-    emissiveIntensity: 0.32,
-    roughness: 0.38,
+    color: 0xffe678,
+    emissive: 0x6b4506,
+    emissiveIntensity: 0.4,
+    roughness: 0.36,
   });
   const antherMat = new THREE.MeshStandardMaterial({
-    color: 0xf4b628,
-    roughness: 0.42,
+    color: 0xf7be2e,
+    emissive: 0x523204,
+    emissiveIntensity: 0.22,
+    roughness: 0.38,
   });
-  const stamenCount = 36;
-  for (let i = 0; i < stamenCount; i++) {
-    const ang = (i / stamenCount) * Math.PI * 2 + (i % 2) * 0.06;
-    const ringR = i % 2 === 0 ? 0.025 : 0.030;
-    const sHolder = new THREE.Group();
-    sHolder.rotation.y = ang;
-    const stem = new THREE.Mesh(filamentGeo, stamenMat);
-    stem.position.set(0, 0.013, ringR);
-    stem.rotation.x = i % 2 === 0 ? 0.18 : 0.31;
-    stem.castShadow = true;
-    const tip = new THREE.Mesh(antherGeo, antherMat);
-    tip.position.set(0, 0.033, 0);
-    stem.add(tip);
-    sHolder.add(stem);
-    flowerRoot.add(sHolder);
-  }
+  const stamenCount = 40;
+  const filamentInst = new THREE.InstancedMesh(filamentGeo, stamenMat, stamenCount);
+  filamentInst.castShadow = true;
+  filamentInst.raycast = noopRaycast;
+  const antherInst = new THREE.InstancedMesh(antherGeo, antherMat, stamenCount);
+  antherInst.raycast = noopRaycast;
 
-  // Striated creamy-ivory-to-lotus-pink texture + backlit edge translucency glow
+  const holderScratch = new THREE.Object3D();
+  const stemScratch = new THREE.Object3D();
+  const tipScratch = new THREE.Object3D();
+  holderScratch.add(stemScratch);
+  stemScratch.add(tipScratch);
+  tipScratch.position.set(0, 0.036, 0);
+
+  for (let i = 0; i < stamenCount; i++) {
+    const ang = (i / stamenCount) * Math.PI * 2 + (i % 2) * 0.055;
+    const ringR = i % 2 === 0 ? 0.0235 : 0.0278;
+    holderScratch.rotation.set(0, ang, 0);
+    stemScratch.position.set(0, 0.0155, ringR);
+    stemScratch.rotation.set(i % 2 === 0 ? 0.24 : 0.36, 0, 0);
+    holderScratch.updateMatrixWorld(true);
+    filamentInst.setMatrixAt(i, stemScratch.matrixWorld);
+    antherInst.setMatrixAt(i, tipScratch.matrixWorld);
+  }
+  filamentInst.instanceMatrix.needsUpdate = true;
+  antherInst.instanceMatrix.needsUpdate = true;
+  flowerRoot.add(filamentInst, antherInst);
+
+  // Striated creamy-ivory-to-lotus-pink texture + deep inner-cup rose-plum AO + backlit edge translucency
   const petalTexture = createLotusPetalTexture(maxAnisotropy);
   const petalMat = new THREE.MeshPhysicalMaterial({
     color: 0xffffff,
     map: petalTexture,
     vertexColors: true,
-    roughness: 0.40,
+    roughness: 0.42,
     metalness: 0.0,
-    clearcoat: 0.10,
-    clearcoatRoughness: 0.46,
-    sheen: 0.55,
-    sheenColor: new THREE.Color('#ffe4ef'),
+    clearcoat: 0.06,
+    clearcoatRoughness: 0.52,
+    sheen: 0.6,
+    sheenRoughness: 0.55,
+    sheenColor: new THREE.Color('#ffdbe9'),
     side: THREE.DoubleSide,
   });
   petalMat.onBeforeCompile = (shader) => {
@@ -1208,13 +1369,16 @@ export function createPondFlora(
       .replace(
         '#include <common>',
         `#include <common>
+        attribute float aPetalAo;
         varying vec2 vLotusUv;
-        varying vec3 vLotusWorld;`,
+        varying vec3 vLotusWorld;
+        varying float vLotusAo;`,
       )
       .replace(
         '#include <project_vertex>',
         `#include <project_vertex>
         vLotusUv = uv;
+        vLotusAo = aPetalAo;
         vLotusWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;`,
       );
     shader.fragmentShader = shader.fragmentShader
@@ -1222,20 +1386,33 @@ export function createPondFlora(
         '#include <common>',
         `#include <common>
         varying vec2 vLotusUv;
-        varying vec3 vLotusWorld;`,
+        varying vec3 vLotusWorld;
+        varying float vLotusAo;`,
+      )
+      .replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+        // Deep inner-cup Ambient Occlusion: warm rose-plum shadow tucked into lower 35% of each petal
+        float aoT = clamp((vLotusAo - 0.38) / 0.62, 0.0, 1.0);
+        float cupMask = smoothstep(0.08, 0.42, vLotusUv.y) * aoT;
+        diffuseColor.rgb *= mix(vec3(0.38, 0.22, 0.30), vec3(1.0), cupMask);`,
       )
       .replace(
         '#include <lights_fragment_end>',
         `#include <lights_fragment_end>
+        float cupAo = mix(0.38, 1.0, clamp((vLotusAo - 0.38) / 0.62, 0.0, 1.0) * smoothstep(0.06, 0.40, vLotusUv.y));
+        reflectedLight.indirectDiffuse *= cupAo;
+        reflectedLight.directDiffuse *= mix(0.42, 1.0, cupAo);
+
         vec3 lotusViewDir = normalize(cameraPosition - vLotusWorld);
-        vec3 lotusLightDir = normalize(vec3(0.41, 0.88, -0.25));
-        float backScatter = pow(clamp(dot(lotusViewDir, -lotusLightDir), 0.0, 1.0), 2.3);
-        float wrapLight = clamp(dot(normal, lotusLightDir) * 0.5 + 0.5, 0.0, 1.0);
-        float rimThinness = smoothstep(0.18, 0.94, vLotusUv.y) * (0.55 + 0.45 * abs(vLotusUv.x * 2.0 - 1.0));
-        totalEmissiveRadiance += vec3(1.0, 0.74, 0.85) * (backScatter * 0.42 + wrapLight * 0.13) * rimThinness;`,
+        vec3 lotusSunDir = normalize(vec3(1.92, 4.15, -1.18));
+        float backScatter = pow(clamp(dot(lotusViewDir, -lotusSunDir), 0.0, 1.0), 2.5);
+        float wrapLight = clamp(dot(normal, lotusSunDir) * 0.5 + 0.5, 0.0, 1.0);
+        float rimThinness = smoothstep(0.35, 0.94, vLotusUv.y) * (0.48 + 0.52 * abs(vLotusUv.x * 2.0 - 1.0));
+        totalEmissiveRadiance += vec3(1.0, 0.68, 0.79) * (backScatter * 0.42 + wrapLight * 0.10) * rimThinness * mix(0.22, 1.0, cupAo);`,
       );
   };
-  petalMat.customProgramCacheKey = () => 'lotus-subsurface-petal-v2';
+  petalMat.customProgramCacheKey = () => 'lotus-subsurface-petal-ao-v4';
 
   const corePetalGeo = createLotusPetalGeometry(0.064, 0.044, 0.016);
   const innerPetalGeo = createLotusPetalGeometry(0.078, 0.054, 0.019);
@@ -1246,30 +1423,51 @@ export function createPondFlora(
   // 5 staggered golden-angle phyllotaxis tiers forming a natural cupped Nelumbo chalice (36 petals)
   const goldenOffset = 2.39996;
   const tiers = [
-    { geo: corePetalGeo, count: 5, pitch: -1.25, r: 0.023, y: 0.010, offset: 0.14 },
-    { geo: innerPetalGeo, count: 7, pitch: -1.06, r: 0.027, y: 0.008, offset: goldenOffset },
-    { geo: midPetalGeo, count: 8, pitch: -0.84, r: 0.030, y: 0.005, offset: goldenOffset * 2 },
-    { geo: outerMidPetalGeo, count: 8, pitch: -0.60, r: 0.033, y: 0.002, offset: goldenOffset * 3 },
-    { geo: outerPetalGeo, count: 8, pitch: -0.34, r: 0.034, y: 0.000, offset: goldenOffset * 4 },
+    { geo: corePetalGeo, count: 5, pitch: -1.12, r: 0.032, y: 0.010, offset: 0.14 },
+    { geo: innerPetalGeo, count: 7, pitch: -0.94, r: 0.035, y: 0.008, offset: goldenOffset },
+    { geo: midPetalGeo, count: 8, pitch: -0.74, r: 0.038, y: 0.005, offset: goldenOffset * 2 },
+    { geo: outerMidPetalGeo, count: 8, pitch: -0.54, r: 0.041, y: 0.002, offset: goldenOffset * 3 },
+    { geo: outerPetalGeo, count: 8, pitch: -0.32, r: 0.043, y: 0.000, offset: goldenOffset * 4 },
   ];
 
+  const petalHolderScratch = new THREE.Object3D();
+  const petalMeshScratch = new THREE.Object3D();
+  petalHolderScratch.add(petalMeshScratch);
+  const petalParts: THREE.BufferGeometry[] = [];
   tiers.forEach((tier, tIdx) => {
     for (let i = 0; i < tier.count; i++) {
       const ang = (i / tier.count) * Math.PI * 2 + tier.offset;
-      const pHolder = new THREE.Group();
-      pHolder.rotation.y = ang;
-      const pMesh = new THREE.Mesh(tier.geo, petalMat);
-      pMesh.position.set(0, tier.y, tier.r);
-      pMesh.rotation.x = tier.pitch + Math.sin(i * 2.1 + tIdx) * 0.038;
-      pMesh.castShadow = true;
-      pMesh.receiveShadow = true;
-      pHolder.add(pMesh);
-      flowerRoot.add(pHolder);
+      petalHolderScratch.rotation.set(0, ang, 0);
+      petalMeshScratch.position.set(0, tier.y, tier.r);
+      petalMeshScratch.rotation.set(tier.pitch + Math.sin(i * 2.1 + tIdx) * 0.038, 0, 0);
+      petalHolderScratch.updateMatrixWorld(true);
+      const part = tier.geo.clone();
+      part.applyMatrix4(petalMeshScratch.matrixWorld);
+      petalParts.push(part);
     }
   });
+  const mergedPetalsGeo = mergeGeometries(petalParts, false);
+  petalParts.forEach((g) => g.dispose());
+  if (mergedPetalsGeo) {
+    const petalsMesh = new THREE.Mesh(mergedPetalsGeo, petalMat);
+    petalsMesh.castShadow = true;
+    petalsMesh.receiveShadow = true;
+    flowerRoot.add(petalsMesh);
+    disposables.push(mergedPetalsGeo);
+  }
 
   // 2. LARGE HALF-EMERGED TOP-RIGHT GRANITE BOULDERS (50% above waterY, 50% submerged below)
   const graniteCausticTimeUniform = { value: 0 };
+  const graniteWaveTexUniform: { value: THREE.Texture | null } = { value: null };
+  const graniteWaveTexelUniform = { value: new THREE.Vector2(1 / 384, 1 / 384) };
+  const granitePondBoundsUniform = {
+    value: new THREE.Vector4(
+      POND_BOUNDS.minX,
+      POND_BOUNDS.maxX,
+      POND_BOUNDS.minZ,
+      POND_BOUNDS.maxZ,
+    ),
+  };
   const graniteTextures = createGraniteBoulderTextures(maxAnisotropy);
   const graniteMat = new THREE.MeshStandardMaterial({
     color: 0xffffff,
@@ -1285,6 +1483,9 @@ export function createPondFlora(
   graniteMat.onBeforeCompile = (shader) => {
     shader.uniforms.uWaterY = { value: waterY };
     shader.uniforms.uCausticTime = graniteCausticTimeUniform;
+    shader.uniforms.tWave = graniteWaveTexUniform;
+    shader.uniforms.uWaveTexel = graniteWaveTexelUniform;
+    shader.uniforms.uPondBounds = granitePondBoundsUniform;
     shader.vertexShader = shader.vertexShader
       .replace(
         '#include <common>',
@@ -1305,56 +1506,22 @@ export function createPondFlora(
         `#include <common>
         uniform float uWaterY;
         uniform float uCausticTime;
+        uniform sampler2D tWave;
+        uniform vec2 uWaveTexel;
+        uniform vec4 uPondBounds;
         varying vec3 vBoulderWorld;
         varying vec3 vBoulderNormalW;
 
-        vec2 boulderCausticHash2(vec2 p) {
-          p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
-          return fract(sin(p) * 43758.5453123);
-        }
-
-        float boulderVoronoiEdge(vec2 x, float t) {
-          vec2 n = floor(x);
-          vec2 f = fract(x);
-          float d1 = 8.0;
-          float d2 = 8.0;
-          for (int j = -1; j <= 1; j++) {
-            for (int i = -1; i <= 1; i++) {
-              vec2 g = vec2(float(i), float(j));
-              vec2 o = boulderCausticHash2(n + g);
-              o = 0.5 + 0.44 * sin(t + 6.2831 * o);
-              vec2 r = g - f + o;
-              float d = dot(r, r);
-              if (d < d1) {
-                d2 = d1;
-                d1 = d;
-              } else if (d < d2) {
-                d2 = d;
-              }
-            }
-          }
-          return pow(clamp(1.0 - abs(sqrt(d2) - sqrt(d1)) * 4.4, 0.0, 1.0), 3.6);
-        }
-
-        float boulderCausticArcs(vec2 p, float t) {
-          vec2 warp = vec2(
-            sin(p.y * 1.6 + t * 0.42) + cos(p.x * 1.1 - t * 0.35) * 0.5,
-            cos(p.x * 1.5 - t * 0.38) + sin(p.y * 1.2 + t * 0.31) * 0.5
-          ) * 0.24;
-          float f1 = boulderVoronoiEdge((p + warp) * 1.55, t * 0.72);
-          float f2 = boulderVoronoiEdge((mat2(0.8, -0.6, 0.6, 0.8) * (p - warp * 0.8)) * 1.95 + vec2(3.7, -2.1), -t * 0.58 + 1.9);
-          float break1 = smoothstep(0.08, 0.68, sin(p.x * 1.85 - p.y * 1.35 + t * 0.28 + sin(p.y * 2.1) * 0.7));
-          float break2 = smoothstep(0.08, 0.68, cos(p.x * 1.55 + p.y * 1.75 - t * 0.24 + cos(p.x * 1.9) * 0.7));
-          float sunPocket = smoothstep(-0.12, 0.52, sin(p.x * 0.85 + t * 0.14) * cos(p.y * 0.95 - t * 0.12));
-          return clamp(f1 * break1 + f2 * break2 * 0.78, 0.0, 1.0) * (0.30 + 0.70 * sunPocket);
-        }`,
+        ${POND_CAUSTICS_GLSL}`,
       )
       .replace(
         '#include <color_fragment>',
         `#include <color_fragment>
-        // Wet waterline band darkening & sheen right at water level
-        float bWet = 1.0 - smoothstep(uWaterY - 0.015, uWaterY + 0.038, vBoulderWorld.y);
-        diffuseColor.rgb *= mix(1.0, 0.34, bWet);
+        // Dark wet waterline collar right at water level, easing into natural matte wet granite underwater
+        float bWetCollar = smoothstep(uWaterY - 0.075, uWaterY - 0.010, vBoulderWorld.y)
+                         * (1.0 - smoothstep(uWaterY - 0.005, uWaterY + 0.038, vBoulderWorld.y));
+        float bSubmergedColor = 1.0 - smoothstep(uWaterY - 0.020, uWaterY + 0.018, vBoulderWorld.y);
+        diffuseColor.rgb *= mix(1.0, 0.56, bSubmergedColor) * mix(1.0, 0.72, bWetCollar);
 
         // Subtle dark damp algae mineral patina near waterline
         float bDryMask = smoothstep(uWaterY + 0.012, uWaterY + 0.060, vBoulderWorld.y);
@@ -1367,21 +1534,40 @@ export function createPondFlora(
       .replace(
         '#include <roughnessmap_fragment>',
         `#include <roughnessmap_fragment>
-        float bWetRough = 1.0 - smoothstep(uWaterY - 0.015, uWaterY + 0.038, vBoulderWorld.y);
-        roughnessFactor = mix(roughnessFactor, 0.24, bWetRough);`,
+        // Keep damp sheen strictly on the narrow above-waterline meniscus collar; underwater stone remains matte
+        float bMeniscusWet = smoothstep(uWaterY - 0.008, uWaterY + 0.004, vBoulderWorld.y)
+                           * (1.0 - smoothstep(uWaterY + 0.012, uWaterY + 0.038, vBoulderWorld.y));
+        roughnessFactor = mix(roughnessFactor, 0.54, bMeniscusWet);`,
       )
       .replace(
         '#include <lights_fragment_end>',
         `#include <lights_fragment_end>
+        // Eliminate specular & environment reflections on submerged stone surfaces underwater
+        float bSubmerged = 1.0 - smoothstep(uWaterY - 0.018, uWaterY + 0.006, vBoulderWorld.y);
+        reflectedLight.directSpecular *= (1.0 - bSubmerged);
+        reflectedLight.indirectSpecular *= (1.0 - bSubmerged);
+
         float bSubMask = 1.0 - smoothstep(uWaterY - 0.06, uWaterY + 0.01, vBoulderWorld.y);
         if (bSubMask > 0.01) {
-          float bCaustic = boulderCausticArcs(vBoulderWorld.xz, uCausticTime * 0.82);
-          float bEdgeFade = exp(-dot(vBoulderWorld.xz, vBoulderWorld.xz) * 0.10);
-          reflectedLight.directDiffuse += vec3(0.88, 0.95, 0.89) * (bCaustic * 0.155) * bSubMask * bEdgeFade;
+          float bWaveRing = pondWaveLaplacianCaustic(
+            tWave,
+            uWaveTexel,
+            uPondBounds,
+            vBoulderWorld,
+            uWaterY
+          );
+          float bShadow = 1.0;
+          #if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+            DirectionalLightShadow bDirShadow = directionalLightShadows[ 0 ];
+            bShadow = receiveShadow ? getShadow( directionalShadowMap[ 0 ], bDirShadow.shadowMapSize, bDirShadow.shadowIntensity, bDirShadow.shadowBias, bDirShadow.shadowRadius, vDirectionalShadowCoord[ 0 ] ) : 1.0;
+          #endif
+          float bThreads = pondAmbientSunThreads(vBoulderWorld.xz, uCausticTime);
+          float bCover = pondCausticCoverMask(vBoulderWorld.xz, bShadow);
+          reflectedLight.directDiffuse += vec3(1.0, 0.94, 0.76) * (bWaveRing * 0.16 + bThreads * 0.08) * bSubMask * bCover;
         }`,
       );
   };
-  graniteMat.customProgramCacheKey = () => 'granite-boulder-wet-moss-voronoi-v6';
+  graniteMat.customProgramCacheKey = () => 'granite-boulder-wet-moss-laplacian-v10';
 
   const boulderMossTextures = createMossClumpTextures(maxAnisotropy);
   const boulderMossMats = [0xdde5ce, 0xcad6b8, 0xe4ead5].map((col) =>
@@ -1393,53 +1579,84 @@ export function createPondFlora(
     createCreepingMossMatGeometry(7.6),
   ];
 
-  const submergedReefMat = new THREE.MeshStandardMaterial({
-    color: 0x1a2223,
-    roughness: 0.9,
-    metalness: 0.02,
-  });
-
+  const boulderMossBuckets: THREE.BufferGeometry[][] = boulderMossMats.map(() => []);
+  const yAxisVec = new THREE.Vector3(0, 1, 0);
+  const mossScratch = new THREE.Object3D();
   POND_LAYOUT.emergentBoulders.forEach((b, idx) => {
-    const bGeo = createGraniteBoulderGeometry(b.radius, b.aboveWater, b.belowWater, idx * 3.7 + 1.2);
+    const bSeed = idx * 3.7 + 1.2;
+    const bGeo = createGraniteBoulderGeometry(b.radius, b.aboveWater, bSeed);
     const bMesh = new THREE.Mesh(bGeo, graniteMat);
-    // Centered right at waterY so ~50% protrudes above waterY and ~50% extends submerged below waterY
-    bMesh.position.set(b.x, waterY + (b.aboveWater - b.belowWater) * 0.1, b.z);
+    bMesh.position.set(b.x, waterY + 0.008, b.z);
     bMesh.rotation.y = b.yaw;
     bMesh.castShadow = true;
     bMesh.receiveShadow = true;
     group.add(bMesh);
     disposables.push(bGeo);
 
-    // Low-profile velvety creeping moss mats hugging granite crevices & waterline ledges
-    const tuftAngles = [b.yaw + 0.5, b.yaw + 2.35, b.yaw + 4.15];
-    tuftAngles.forEach((ang, tIdx) => {
-      const radialFrac = tIdx === 0 ? 0.52 : 0.68;
-      const tx = b.x + Math.cos(ang) * b.radius * radialFrac;
-      const tz = b.z + Math.sin(ang) * b.radius * radialFrac * 0.88;
-      const ty = waterY + (tIdx === 0 ? b.aboveWater * 0.56 : b.aboveWater * 0.2);
-      const tMesh = new THREE.Mesh(
-        boulderTuftGeos[(idx + tIdx) % boulderTuftGeos.length],
-        boulderMossMats[(idx + tIdx) % boulderMossMats.length],
+    // Low-profile velvety creeping moss mats tucked gently onto upper rounded boulder crowns
+    const tuftLocalAngles = [0.65, 2.45, 4.25];
+    const dirVec = new THREE.Vector3();
+    const surfVec = new THREE.Vector3();
+    const surfQuat = new THREE.Quaternion();
+    const yawQuat = new THREE.Quaternion();
+    tuftLocalAngles.forEach((localAng, tIdx) => {
+      const elev = tIdx === 0 ? 0.82 : 0.62;
+      dirVec
+        .set(
+          Math.cos(localAng) * Math.cos(elev),
+          Math.sin(elev),
+          Math.sin(localAng) * Math.cos(elev),
+        )
+        .normalize();
+      evaluateGraniteBoulderVertex(
+        dirVec,
+        b.radius,
+        b.aboveWater,
+        bSeed,
+        surfVec,
       );
-      tMesh.position.set(tx, ty, tz);
-      const sBase = b.radius * (tIdx === 0 ? 0.25 : 0.21);
-      tMesh.scale.set(sBase * 1.45, sBase * 0.48, sBase * 1.15);
-      tMesh.rotation.set(0.06 * Math.sin(ang), ang, 0.06 * Math.cos(ang));
-      tMesh.castShadow = true;
-      tMesh.receiveShadow = true;
-      aboveWaterGroup.add(tMesh);
+      surfVec.applyAxisAngle(yAxisVec, b.yaw);
+      const worldDir = dirVec.clone().applyAxisAngle(yAxisVec, b.yaw);
+      mossScratch.position.set(
+        b.x + surfVec.x - worldDir.x * 0.005,
+        waterY + 0.008 + surfVec.y - worldDir.y * 0.005,
+        b.z + surfVec.z - worldDir.z * 0.005,
+      );
+      const sBase = b.radius * (tIdx === 0 ? 0.21 : 0.16);
+      mossScratch.scale.set(sBase * 1.25, sBase * 0.36, sBase * 0.95);
+      surfQuat.setFromUnitVectors(yAxisVec, worldDir);
+      yawQuat.setFromAxisAngle(yAxisVec, localAng + b.yaw);
+      mossScratch.quaternion.copy(surfQuat).multiply(yawQuat);
+      mossScratch.updateMatrix();
+      const part = boulderTuftGeos[(idx + tIdx) % boulderTuftGeos.length].clone();
+      part.applyMatrix4(mossScratch.matrix);
+      boulderMossBuckets[(idx + tIdx) % boulderMossMats.length].push(part);
     });
+  });
 
-    // Broad dark submerged stone plinth connecting boulder base cleanly into pond bed (zero underwater gap)
-    const plinthH = waterY - b.belowWater * 0.55 - bedY + 0.06;
-    if (plinthH > 0.04) {
-      const pGeo = new THREE.CylinderGeometry(b.radius * 0.85, b.radius * 1.18, plinthH, 14);
-      const pMesh = new THREE.Mesh(pGeo, submergedReefMat);
-      pMesh.position.set(b.x, bedY + plinthH * 0.5 - 0.02, b.z);
-      pMesh.receiveShadow = true;
-      group.add(pMesh);
-      disposables.push(pGeo);
-    }
+  // Clustered submerged big river stones across the right bank grounding the emergent cobbles naturally into the bed
+  RIGHT_UNDERWATER_SHOAL_STONES.forEach((ss) => {
+    const sGeo = createGraniteBoulderGeometry(ss.radius, ss.height, ss.seed);
+    const sMesh = new THREE.Mesh(sGeo, graniteMat);
+    sMesh.position.set(ss.x, computeSubmergedStoneCenterY(waterY, bedY, ss), ss.z);
+    sMesh.rotation.y = ss.yaw;
+    sMesh.castShadow = false;
+    sMesh.receiveShadow = true;
+    sMesh.raycast = noopRaycast;
+    group.add(sMesh);
+    disposables.push(sGeo);
+  });
+  boulderMossBuckets.forEach((parts, matIdx) => {
+    if (parts.length === 0) return;
+    const mergedGeo = mergeGeometries(parts, false);
+    parts.forEach((g) => g.dispose());
+    if (!mergedGeo) return;
+    const mergedMesh = new THREE.Mesh(mergedGeo, boulderMossMats[matIdx]);
+    mergedMesh.castShadow = true;
+    mergedMesh.receiveShadow = true;
+    mergedMesh.raycast = noopRaycast;
+    aboveWaterGroup.add(mergedMesh);
+    disposables.push(mergedGeo);
   });
 
   // 3. TOP-RIGHT ARCHING MULTI-NODE BAMBOO GROVE (kept below top-right UI buttons)
@@ -1666,6 +1883,7 @@ export function createPondFlora(
   });
   const dripMesh = new THREE.Mesh(dropGeo, dropMat);
   dripMesh.visible = false;
+  dripMesh.raycast = noopRaycast;
   aboveWaterGroup.add(dripMesh);
 
   let nextDripAt = 1.4;
@@ -1705,7 +1923,6 @@ export function createPondFlora(
     boulderMossTextures,
     ...boulderMossMats,
     ...boulderTuftGeos,
-    submergedReefMat,
     bambooTextures,
     culmMat,
     nodeRingMat,
@@ -1728,6 +1945,8 @@ export function createPondFlora(
     aboveWaterGroup,
     update: (_dtSec, elapsedSec, waterSim, onDripImpact) => {
       graniteCausticTimeUniform.value = elapsedSec;
+      graniteWaveTexUniform.value = waterSim.texture;
+      graniteWaveTexelUniform.value.copy(waterSim.texelSize);
       // 1. Wave-synced floating bob on lily pads & blooming lotus
       const wMain = waterSim.sampleCpuWaveAt(
         POND_LAYOUT.lotusPadPos.x,

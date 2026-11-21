@@ -52,6 +52,7 @@ export function createBusinessCardPad(
   const meniscusMesh = new THREE.Mesh(meniscusGeo, meniscusMat);
   meniscusMesh.position.y = -0.002;
   meniscusMesh.renderOrder = 2;
+  meniscusMesh.raycast = () => {};
   floatGroup.add(meniscusMesh);
 
   // Radius 0.194 (scaled 0.9 -> 0.1746m < 0.1852m corner distance) + V-notch aimed directly toward open book corner (1.472, 0.437)
@@ -69,11 +70,14 @@ export function createBusinessCardPad(
     bumpMap: padTextures.bumpMap,
     bumpScale: 0.0035,
     roughnessMap: padTextures.roughnessMap,
-    roughness: 0.42,
+    roughness: 0.62,
     metalness: 0.0,
-    clearcoat: 0.34,
-    clearcoatRoughness: 0.32,
-    envMapIntensity: 0.24,
+    clearcoat: 0.06,
+    clearcoatRoughness: 0.56,
+    sheen: 0.3,
+    sheenRoughness: 0.72,
+    sheenColor: new THREE.Color('#7aa658'),
+    envMapIntensity: 0.22,
     side: THREE.DoubleSide,
   });
   const padMesh = new THREE.Mesh(padGeo, padMat);
@@ -104,6 +108,7 @@ export function createBusinessCardPad(
   cardShadowCatcher.position.y = 0.0018;
   cardShadowCatcher.receiveShadow = true;
   cardShadowCatcher.renderOrder = 2;
+  cardShadowCatcher.raycast = () => {};
   floatGroup.add(cardShadowCatcher);
 
   // Exact cloned business card stack resting cleanly atop the dry flat center of the pad

@@ -1,4 +1,176 @@
 import * as THREE from 'three';
+import { FullScreenQuad, Pass } from 'three/addons/postprocessing/Pass.js';
+
+export interface DepthOfFieldUniforms {
+  tDiffuse: { value: THREE.Texture | null };
+  tDepth: { value: THREE.Texture | null };
+  uResolution: { value: THREE.Vector2 };
+  uCameraNear: { value: number };
+  uCameraFar: { value: number };
+  uFocusDist: { value: number };
+  uNearDeadzone: { value: number };
+  uFarDeadzone: { value: number };
+  uNearBlurRange: { value: number };
+  uFarBlurRange: { value: number };
+  uMaxBlurPx: { value: number };
+  uEnabled: { value: number };
+}
+
+/**
+ * Depth-aware soft Depth-of-Field shader running in linear HDR color space
+ * prior to grading & ACES tone mapping. Uses a 16-tap golden-angle Vogel disk
+ * with a wide crisp focal deadzone around the book and foreground-safe gather weights
+ * to prevent blurred backgrounds from bleeding halos onto sharp book edges.
+ */
+export const DepthOfFieldShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    tDepth: { value: null },
+    uResolution: { value: new THREE.Vector2(1440, 900) },
+    uCameraNear: { value: 0.1 },
+    uCameraFar: { value: 40.0 },
+    uFocusDist: { value: 3.8 },
+    uNearDeadzone: { value: 0.36 },
+    uFarDeadzone: { value: 0.34 },
+    uNearBlurRange: { value: 1.0 },
+    uFarBlurRange: { value: 1.05 },
+    uMaxBlurPx: { value: 2.92 },
+    uEnabled: { value: 1.0 },
+  },
+  vertexShader: /* glsl */ `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    uniform sampler2D tDepth;
+    uniform vec2 uResolution;
+    uniform float uCameraNear;
+    uniform float uCameraFar;
+    uniform float uFocusDist;
+    uniform float uNearDeadzone;
+    uniform float uFarDeadzone;
+    uniform float uNearBlurRange;
+    uniform float uFarBlurRange;
+    uniform float uMaxBlurPx;
+    uniform float uEnabled;
+
+    varying vec2 vUv;
+
+    float getLinearDepth(vec2 uv) {
+      float zNdc = texture2D(tDepth, uv).r * 2.0 - 1.0;
+      return (2.0 * uCameraNear * uCameraFar) /
+        max(0.0001, uCameraFar + uCameraNear - zNdc * (uCameraFar - uCameraNear));
+    }
+
+    float computeCoc(float linearDepth) {
+      float delta = linearDepth - uFocusDist;
+      if (delta >= 0.0) {
+        return smoothstep(uFarDeadzone, uFarDeadzone + uFarBlurRange, delta);
+      }
+      return smoothstep(uNearDeadzone, uNearDeadzone + uNearBlurRange, -delta);
+    }
+
+    void main() {
+      vec4 centerTex = texture2D(tDiffuse, vUv);
+      if (uEnabled < 0.5 || uMaxBlurPx <= 0.01) {
+        gl_FragColor = centerTex;
+        return;
+      }
+
+      float centerDepth = getLinearDepth(vUv);
+      float centerCoc = computeCoc(centerDepth);
+
+      // Keep in-focus book pages, ink stems, and focal plane bit-exact sharp
+      if (centerCoc < 0.004) {
+        gl_FragColor = centerTex;
+        return;
+      }
+
+      float refHeightScale = max(0.65, uResolution.y / 900.0);
+      vec2 texelSize = 1.0 / max(vec2(1.0), uResolution);
+      vec2 radiusUv = texelSize * (centerCoc * uMaxBlurPx * refHeightScale);
+
+      // 16-tap golden-angle Vogel disk rotated without per-tap trig
+      const mat2 GOLDEN_ROT = mat2(-0.73736888, 0.67549029, -0.67549029, -0.73736888);
+      vec2 dir = vec2(1.0, 0.0);
+
+      vec3 acc = centerTex.rgb * 0.16;
+      float weightSum = 0.16;
+
+      for (int i = 0; i < 16; i++) {
+        dir = GOLDEN_ROT * dir;
+        float r = sqrt((float(i) + 0.5) / 16.0);
+        vec2 tapUv = clamp(vUv + dir * (r * radiusUv), vec2(0.001), vec2(0.999));
+
+        float tapDepth = getLinearDepth(tapUv);
+        float tapCoc = computeCoc(tapDepth);
+
+        // Depth-aware gather weighting: suppress sharp foreground objects ghosting into background
+        float depthWeight = tapDepth < centerDepth - 0.04
+          ? clamp(max(tapCoc, centerCoc * 0.14), 0.04, 1.0)
+          : clamp(tapCoc + 0.08, 0.08, 1.0);
+        float apertureFalloff = mix(1.0, 0.72, r);
+        float w = depthWeight * apertureFalloff;
+
+        acc += texture2D(tDiffuse, tapUv).rgb * w;
+        weightSum += w;
+      }
+
+      vec3 blurred = acc / max(0.0001, weightSum);
+      float blend = smoothstep(0.0, 0.08, centerCoc);
+      gl_FragColor = vec4(mix(centerTex.rgb, blurred, blend), centerTex.a);
+    }
+  `,
+};
+
+/**
+ * Custom EffectComposer Pass wrapping DepthOfFieldShader so it dynamically binds
+ * `readBuffer.depthTexture` on every frame across EffectComposer ping-pong swaps.
+ */
+export class DepthOfFieldPass extends Pass {
+  public uniforms: DepthOfFieldUniforms;
+  private material: THREE.ShaderMaterial;
+  private fsQuad: FullScreenQuad;
+
+  constructor() {
+    super();
+    this.uniforms = THREE.UniformsUtils.clone(DepthOfFieldShader.uniforms) as DepthOfFieldUniforms;
+    this.material = new THREE.ShaderMaterial({
+      name: 'DepthOfFieldShader',
+      uniforms: this.uniforms as unknown as Record<string, THREE.IUniform>,
+      vertexShader: DepthOfFieldShader.vertexShader,
+      fragmentShader: DepthOfFieldShader.fragmentShader,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.fsQuad = new FullScreenQuad(this.material);
+  }
+
+  public override render(
+    renderer: THREE.WebGLRenderer,
+    writeBuffer: THREE.WebGLRenderTarget,
+    readBuffer: THREE.WebGLRenderTarget,
+  ): void {
+    this.uniforms.tDiffuse.value = readBuffer.texture;
+    this.uniforms.tDepth.value = readBuffer.depthTexture;
+    this.uniforms.uEnabled.value = readBuffer.depthTexture ? 1.0 : 0.0;
+
+    renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer);
+    if (this.clear) {
+      renderer.clear(renderer.autoClearColor, renderer.autoClearDepth, renderer.autoClearStencil);
+    }
+    this.fsQuad.render(renderer);
+  }
+
+  public override dispose(): void {
+    this.material.dispose();
+    this.fsQuad.dispose();
+  }
+}
 
 export interface VignetteGradingUniforms {
   tDiffuse: { value: THREE.Texture | null };

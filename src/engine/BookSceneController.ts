@@ -31,7 +31,12 @@ import {
   type BookControllerState,
   type PageSide,
 } from './bookState';
-import { VignetteGradingShader } from './shaders';
+import {
+  computeBookFocusPoint,
+  computeDofProfile,
+  computeLinearFocusDistance,
+} from './dof';
+import { DepthOfFieldPass, VignetteGradingShader } from './shaders';
 import {
   createBookStaticTextures,
   createPageTextureHandle,
@@ -67,6 +72,7 @@ export class BookSceneController {
 
   private renderer!: THREE.WebGLRenderer;
   private composer: EffectComposer | null = null;
+  private dofPass: DepthOfFieldPass | null = null;
   private gradingPass: ShaderPass | null = null;
   private scene!: THREE.Scene;
   private camera!: THREE.PerspectiveCamera;
@@ -84,9 +90,11 @@ export class BookSceneController {
   private renderBusy = false;
   private renderDirty = false;
   private frameId = 0;
+  private afterDrawTimerId = 0;
   private pondTickId = 0;
   private envStartMs = 0;
   private lastEnvUpdateMs = 0;
+  private lastPondShadowMs = 0;
   private previewAnimId = 0;
   private parallaxAnimId = 0;
   private parallaxLastMs = 0;
@@ -99,6 +107,7 @@ export class BookSceneController {
   private tmpCamBase = new THREE.Vector3();
   private tmpCamTarget = new THREE.Vector3();
   private tmpCamOffset = new THREE.Vector3();
+  private tmpFocusPoint = { x: 0, y: 0, z: 0 };
   private tmpBoundCorners = Array.from({ length: 8 }, () => new THREE.Vector3());
 
   private pageHandles = new Map<string, PageTextureHandle>();
@@ -479,7 +488,6 @@ export class BookSceneController {
   private stopPondLoop() {
     if (this.pondTickId) {
       cancelAnimationFrame(this.pondTickId);
-      clearTimeout(this.pondTickId);
       this.pondTickId = 0;
     }
   }
@@ -594,6 +602,41 @@ export class BookSceneController {
     const isReading =
       this.state.phase === 'open' || this.state.phase === 'turning' || openFactor > 0.7;
     this.gradingPass.uniforms.uBookSharpen.value = isReading ? 0.85 : 0.28;
+  }
+
+  private updateDepthOfFieldUniforms() {
+    if (!this.dofPass || !this.camera) return;
+    const isMobile = this.getViewportTier() === 'mobile';
+    const focusPoint = computeBookFocusPoint(
+      {
+        openProgress: this.animProxy.openProgress,
+        isMobile,
+        mobileSide: this.state.mobileSide,
+        surfaceY: BookSceneController.SURFACE_Y,
+        pageWidth: this.theme.bookDimensions.pageWidth,
+      },
+      this.tmpFocusPoint,
+    );
+    const focusDist = computeLinearFocusDistance({
+      cameraPos: this.camera.position,
+      cameraTarget: this.tmpCamTarget,
+      focusPoint,
+    });
+    const profile = computeDofProfile({
+      openProgress: this.animProxy.openProgress,
+      isMobile,
+      environmentId: this.activeEnvId,
+    });
+
+    const u = this.dofPass.uniforms;
+    u.uCameraNear.value = this.camera.near;
+    u.uCameraFar.value = this.camera.far;
+    u.uFocusDist.value = focusDist;
+    u.uNearDeadzone.value = profile.nearDeadzone;
+    u.uFarDeadzone.value = profile.farDeadzone;
+    u.uNearBlurRange.value = profile.nearBlurRange;
+    u.uFarBlurRange.value = profile.farBlurRange;
+    u.uMaxBlurPx.value = profile.maxBlurPx;
   }
 
   private applyPhaseLighting(openProgress: number) {
@@ -736,20 +779,29 @@ export class BookSceneController {
 
       this.applyPhaseLighting(this.animProxy.openProgress);
 
-      // Post-processing composer with 4x MSAA on GPU: RenderPass -> VignetteGradingShader -> OutputPass
+      // Post-processing composer with 4x MSAA on GPU: RenderPass -> DepthOfFieldPass -> VignetteGradingShader -> OutputPass
       const composerDpr = this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 1.5);
-      const composerTarget = new THREE.WebGLRenderTarget(
-        Math.max(1, Math.round(width * composerDpr)),
-        Math.max(1, Math.round(height * composerDpr)),
-        {
-          samples: this.isSoftwareGl ? 0 : 4,
-          type: THREE.HalfFloatType,
-        },
-      );
+      const rtW = Math.max(1, Math.round(width * composerDpr));
+      const rtH = Math.max(1, Math.round(height * composerDpr));
+      const composerDepthTexture = new THREE.DepthTexture(rtW, rtH, THREE.UnsignedIntType);
+      composerDepthTexture.format = THREE.DepthFormat;
+      composerDepthTexture.minFilter = THREE.NearestFilter;
+      composerDepthTexture.magFilter = THREE.NearestFilter;
+
+      const composerTarget = new THREE.WebGLRenderTarget(rtW, rtH, {
+        samples: this.isSoftwareGl ? 0 : 4,
+        type: THREE.HalfFloatType,
+        depthTexture: composerDepthTexture,
+      });
       this.composer = new EffectComposer(this.renderer, composerTarget);
       this.composer.setPixelRatio(composerDpr);
       this.composer.setSize(width, height);
       this.composer.addPass(new RenderPass(this.scene, this.camera));
+
+      this.dofPass = new DepthOfFieldPass();
+      this.dofPass.uniforms.uResolution.value.set(width, height);
+      this.updateDepthOfFieldUniforms();
+      this.composer.addPass(this.dofPass);
 
       this.gradingPass = new ShaderPass(VignetteGradingShader);
       const u = this.gradingPass.uniforms;
@@ -814,6 +866,7 @@ export class BookSceneController {
 
       this.cleanupFns.push(() => {
         envRT.dispose();
+        composerDepthTexture.dispose();
         composerTarget.dispose();
         this.staticTextures.dispose();
       });
@@ -840,6 +893,7 @@ export class BookSceneController {
       this.camera.updateProjectionMatrix();
       this.renderer.setSize(w, h);
       this.composer?.setSize(w, h);
+      this.dofPass?.uniforms.uResolution.value.set(w, h);
       this.gradingPass?.uniforms.uResolution.value.set(w, h);
       this.environments.forEach((env, envId) => {
         if (this.initializedEnvs.has(envId)) {
@@ -2014,18 +2068,22 @@ export class BookSceneController {
       const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
       gl.flush();
       const poll = () => {
-        if (this.disposed) return;
+        this.afterDrawTimerId = 0;
+        if (this.disposed) {
+          if (sync) gl.deleteSync(sync);
+          return;
+        }
         const status = sync ? gl.getSyncParameter(sync, gl.SYNC_STATUS) : gl.SIGNALED;
         if (status === gl.UNSIGNALED) {
-          this.frameId = window.setTimeout(poll, 4);
+          this.afterDrawTimerId = window.setTimeout(poll, 4);
         } else {
           if (sync) gl.deleteSync(sync);
-          this.frameId = window.setTimeout(cb, 20);
+          this.afterDrawTimerId = window.setTimeout(cb, 20);
         }
       };
-      this.frameId = window.setTimeout(poll, 4);
+      this.afterDrawTimerId = window.setTimeout(poll, 4);
     } else {
-      this.frameId = window.setTimeout(cb, 20);
+      this.afterDrawTimerId = window.setTimeout(cb, 20);
     }
   }
 
@@ -2037,6 +2095,7 @@ export class BookSceneController {
     }
     this.renderBusy = true;
     this.frameId = requestAnimationFrame((nowMs) => {
+      this.frameId = 0;
       if (this.disposed) return;
       this.renderDirty = false;
       if (this.dragState?.active && this.stepActiveDragSmoothing()) {
@@ -2050,12 +2109,22 @@ export class BookSceneController {
         const elapsedSec = (nowMs - this.envStartMs) / 1000;
         activeEnv.update(dtSec, elapsedSec);
         if (this.activeEnvId === 'pond') {
-          this.invalidateShadows();
+          const bookAnimating = Boolean(
+            this.activeTimeline?.isActive() ||
+              this.hoverTween?.isActive() ||
+              this.dragState?.active ||
+              this.dragTween?.isActive(),
+          );
+          if (bookAnimating || nowMs - this.lastPondShadowMs >= 32) {
+            this.lastPondShadowMs = nowMs;
+            this.invalidateShadows();
+          }
         }
         activeEnv.onBeforeMainRender?.(this.renderer, this.scene, this.camera);
       }
 
       this.updateBookShaderBounds();
+      this.updateDepthOfFieldUniforms();
       if (this.composer) {
         this.composer.render();
       } else {
@@ -2089,7 +2158,7 @@ export class BookSceneController {
     clearTimeout(this.preloadQueueTimer);
     clearTimeout(this.dragTickId);
     cancelAnimationFrame(this.frameId);
-    clearTimeout(this.frameId);
+    clearTimeout(this.afterDrawTimerId);
 
     this.environments.forEach((env, envId) => {
       if (this.initializedEnvs.has(envId)) {
@@ -2104,6 +2173,8 @@ export class BookSceneController {
     this.pageHandles.clear();
 
     this.bookRig?.dispose();
+    this.dofPass?.dispose();
+    this.gradingPass?.dispose();
     this.composer?.dispose();
     this.renderer?.dispose();
     if (this.renderer?.domElement?.parentNode) {

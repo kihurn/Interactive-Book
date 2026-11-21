@@ -37,7 +37,11 @@ export class PondEnvironment implements SceneEnvironment {
   private waterSurface: WaterSurfaceRig | null = null;
 
   private aboveWaterObjects: THREE.Object3D[] = [];
-  private rayObstacles: THREE.Object3D[] = [];
+  private rayObstacleEntries: Array<{ obj: THREE.Object3D; box: THREE.Box3 }> = [];
+  private waterHits: THREE.Intersection[] = [];
+  private obstacleHits: THREE.Intersection[] = [];
+  private cardHits: THREE.Intersection[] = [];
+  private tmpBoxHit = new THREE.Vector3();
   private disposables: Array<{ dispose: () => void }> = [];
 
   private waterY = -POND_LAYOUT.waterDepthOffset;
@@ -106,13 +110,13 @@ export class PondEnvironment implements SceneEnvironment {
       ...(ctx.bookGroup ? [ctx.bookGroup] : []),
     ];
 
-    this.rayObstacles = [
-      this.waterSurface.waterMesh,
-      this.floatingPlank.group,
-      this.cardPad.group,
-      this.lantern.group,
-      this.flora.group,
+    this.rayObstacleEntries = [
+      { obj: this.floatingPlank.group, box: new THREE.Box3() },
+      { obj: this.cardPad.group, box: new THREE.Box3() },
+      { obj: this.lantern.group, box: new THREE.Box3() },
+      { obj: this.flora.group, box: new THREE.Box3() },
     ];
+    this.refreshObstacleBoxes();
 
     this.disposables.push(
       this.waterSim,
@@ -129,10 +133,50 @@ export class PondEnvironment implements SceneEnvironment {
     scene.add(this.group);
   }
 
+  private refreshObstacleBoxes(): void {
+    this.group.updateMatrixWorld(true);
+    for (let i = 0; i < this.rayObstacleEntries.length; i++) {
+      const entry = this.rayObstacleEntries[i];
+      entry.box.setFromObject(entry.obj);
+      // Pad generously for gentle wave bobbing, leaf drift, and bamboo wind sway
+      entry.box.expandByScalar(0.14);
+    }
+  }
+
+  private pickOpenWaterPoint(raycaster: THREE.Raycaster): THREE.Vector3 | null {
+    if (!this.waterSurface) return null;
+    this.waterHits.length = 0;
+    raycaster.intersectObject(this.waterSurface.waterMesh, false, this.waterHits);
+    if (this.waterHits.length === 0) return null;
+
+    const waterHit = this.waterHits[0];
+    const waterDist = waterHit.distance;
+
+    for (let i = 0; i < this.rayObstacleEntries.length; i++) {
+      const { obj, box } = this.rayObstacleEntries[i];
+      if (!obj.visible) continue;
+      if (!box.containsPoint(raycaster.ray.origin)) {
+        const hitPt = raycaster.ray.intersectBox(box, this.tmpBoxHit);
+        if (!hitPt || hitPt.distanceTo(raycaster.ray.origin) >= waterDist) continue;
+      }
+      this.obstacleHits.length = 0;
+      raycaster.intersectObject(obj, true, this.obstacleHits);
+      for (let h = 0; h < this.obstacleHits.length; h++) {
+        const hit = this.obstacleHits[h];
+        if (hit.object.visible && hit.distance < waterDist) {
+          return null;
+        }
+      }
+    }
+
+    return waterHit.point;
+  }
+
   public applyViewportLayout(tier: 'desktop' | 'tablet' | 'mobile'): void {
     const layout = this.theme.props[tier].cards;
     this.currentCardPos = { x: layout.position.x, z: layout.position.z };
     this.cardPad?.applyPlacement(layout);
+    this.refreshObstacleBoxes();
   }
 
   public setActive(active: boolean): void {
@@ -159,9 +203,9 @@ export class PondEnvironment implements SceneEnvironment {
     const bookOpen = this.ctx.getBookOpenProgress?.() ?? 0;
 
     this.waterSim.step(this.ctx.renderer, dt, elapsed);
-    this.pondBed?.update(elapsed);
+    this.pondBed?.update(elapsed, this.waterSim);
     this.floatingPlank?.update(elapsed, this.waterSim, bookOpen);
-    this.lantern?.update(elapsed);
+    this.lantern?.update(elapsed, this.waterSim);
 
     this.flora?.update(dt, elapsed, this.waterSim, (dripX, dripZ) => {
       if (this.ctx && this.waterSim) {
@@ -197,8 +241,9 @@ export class PondEnvironment implements SceneEnvironment {
     }
 
     // 1. Check Business Card resting dry on top-center of its lily pad first
-    const cardHits = raycaster.intersectObjects(this.cardPad.hitTargets, false);
-    if (cardHits.length > 0) {
+    this.cardHits.length = 0;
+    raycaster.intersectObjects(this.cardPad.hitTargets, false, this.cardHits);
+    if (this.cardHits.length > 0) {
       if (!this.cardHovered) {
         this.cardHovered = true;
         this.ctx.onCursorInteractiveChange?.(true);
@@ -222,18 +267,15 @@ export class PondEnvironment implements SceneEnvironment {
     }
 
     // 2. Raycast water vs solid visible pond islands; only ripple when closest hit is open water
-    const hits = raycaster
-      .intersectObjects(this.rayObstacles, true)
-      .filter((h) => h.object.visible);
-    if (hits.length > 0 && hits[0].object === this.waterSurface.waterMesh) {
-      const pt = hits[0].point;
+    const waterPt = this.pickOpenWaterPoint(raycaster);
+    if (waterPt) {
       const now = performance.now();
-      const moved = Math.hypot(pt.x - this.lastRippleX, pt.z - this.lastRippleZ);
+      const moved = Math.hypot(waterPt.x - this.lastRippleX, waterPt.z - this.lastRippleZ);
       if (now - this.lastRippleTimeMs > 24 && moved > 0.025) {
         this.lastRippleTimeMs = now;
-        this.lastRippleX = pt.x;
-        this.lastRippleZ = pt.z;
-        this.waterSim.addDrop(this.ctx.renderer, pt.x, pt.z, 0.17, 0.19);
+        this.lastRippleX = waterPt.x;
+        this.lastRippleZ = waterPt.z;
+        this.waterSim.addDrop(this.ctx.renderer, waterPt.x, waterPt.z, 0.17, 0.19);
       }
       return false;
     }
@@ -246,18 +288,16 @@ export class PondEnvironment implements SceneEnvironment {
       return false;
     }
 
-    const cardHits = raycaster.intersectObjects(this.cardPad.hitTargets, false);
-    if (cardHits.length > 0) {
+    this.cardHits.length = 0;
+    raycaster.intersectObjects(this.cardPad.hitTargets, false, this.cardHits);
+    if (this.cardHits.length > 0) {
       return false;
     }
 
-    const hits = raycaster
-      .intersectObjects(this.rayObstacles, true)
-      .filter((h) => h.object.visible);
-    if (hits.length > 0 && hits[0].object === this.waterSurface.waterMesh) {
-      const pt = hits[0].point;
+    const waterPt = this.pickOpenWaterPoint(raycaster);
+    if (waterPt) {
       this.lastDownSplashMs = performance.now();
-      this.waterSim.addDrop(this.ctx.renderer, pt.x, pt.z, 0.25, 0.46);
+      this.waterSim.addDrop(this.ctx.renderer, waterPt.x, waterPt.z, 0.25, 0.46);
       return true;
     }
 
@@ -269,19 +309,17 @@ export class PondEnvironment implements SceneEnvironment {
       return false;
     }
 
-    const cardHits = raycaster.intersectObjects(this.cardPad.hitTargets, false);
-    if (cardHits.length > 0) {
+    this.cardHits.length = 0;
+    raycaster.intersectObjects(this.cardPad.hitTargets, false, this.cardHits);
+    if (this.cardHits.length > 0) {
       this.ctx.onOpenContact?.();
       return true;
     }
 
-    const hits = raycaster
-      .intersectObjects(this.rayObstacles, true)
-      .filter((h) => h.object.visible);
-    if (hits.length > 0 && hits[0].object === this.waterSurface.waterMesh) {
+    const waterPt = this.pickOpenWaterPoint(raycaster);
+    if (waterPt) {
       if (performance.now() - this.lastDownSplashMs > 220) {
-        const pt = hits[0].point;
-        this.waterSim.addDrop(this.ctx.renderer, pt.x, pt.z, 0.25, 0.46);
+        this.waterSim.addDrop(this.ctx.renderer, waterPt.x, waterPt.z, 0.25, 0.46);
       }
       return true;
     }
@@ -301,7 +339,10 @@ export class PondEnvironment implements SceneEnvironment {
     this.disposables.forEach((d) => d.dispose());
     this.disposables = [];
     this.aboveWaterObjects = [];
-    this.rayObstacles = [];
+    this.rayObstacleEntries = [];
+    this.waterHits.length = 0;
+    this.obstacleHits.length = 0;
+    this.cardHits.length = 0;
     if (this.group.parent) {
       this.group.parent.remove(this.group);
     }

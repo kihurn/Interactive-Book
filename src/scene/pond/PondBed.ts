@@ -1,11 +1,13 @@
 import * as THREE from 'three';
+import { POND_CAUSTICS_GLSL } from './causticsShader';
 import { POND_BOUNDS, POND_LAYOUT, POND_OBSTACLES, signedDistanceToObstacle } from './constants';
+import type { WaterSimulation } from './WaterSimulation';
 
 export interface PondBedRig {
   group: THREE.Group;
   bedMesh: THREE.Mesh;
   pebblesMesh: THREE.InstancedMesh;
-  update: (elapsedSec: number) => void;
+  update: (elapsedSec: number, waterSim?: WaterSimulation) => void;
   dispose: () => void;
 }
 
@@ -47,13 +49,17 @@ function createPondGravelTextures(maxAnisotropy: number): {
     return v - Math.floor(v);
   };
 
-  // Seamless wrapping helper for 3x3 periodic edge repetition
+  // Seamless wrapping helper for 3x3 periodic edge repetition (fast-path interior elements)
   const drawWrapped = (
     drawFn: (ox: number, oy: number) => void,
     x: number,
     y: number,
     margin: number,
   ) => {
+    if (x >= margin && x <= size - margin && y >= margin && y <= size - margin) {
+      drawFn(x, y);
+      return;
+    }
     for (let dx = -1; dx <= 1; dx++) {
       for (let dy = -1; dy <= 1; dy++) {
         const nx = x + dx * size;
@@ -85,7 +91,7 @@ function createPondGravelTextures(maxAnisotropy: number): {
             ? 'rgba(54, 50, 42, 0.22)'
             : tone === 3
               ? 'rgba(28, 36, 30, 0.22)'
-              : 'rgba(66, 68, 65, 0.16)';
+              : 'rgba(42, 46, 44, 0.16)';
 
     drawWrapped(
       (ox, oy) => {
@@ -100,15 +106,15 @@ function createPondGravelTextures(maxAnisotropy: number): {
     );
   }
 
-  // 2. Packed sub-centimeter shingle stones baked into streambed texture
+  // 2. Packed sub-centimeter shingle stones baked into streambed texture (muted wet river tones)
   const shinglePalette = [
-    '#2a2f32',
-    '#3d4448',
-    '#4f493f',
-    '#323934',
-    '#5c5e5b',
-    '#23282a',
-    '#484c47',
+    '#202528',
+    '#2d3539',
+    '#3b342b',
+    '#2a352c',
+    '#393e3c',
+    '#1f2426',
+    '#363a37',
   ];
   for (let i = 0; i < 2400; i++) {
     const x = hash(i * 7 + 11) * size;
@@ -123,7 +129,7 @@ function createPondGravelTextures(maxAnisotropy: number): {
     drawWrapped(
       (ox, oy) => {
         // Dark crevice shadow halo around each packed pebble
-        cCtx.fillStyle = 'rgba(8, 10, 11, 0.42)';
+        cCtx.fillStyle = 'rgba(8, 10, 11, 0.45)';
         cCtx.beginPath();
         cCtx.ellipse(ox + 1.1, oy + 1.3, rx * 1.12, ry * 1.12, ang, 0, Math.PI * 2);
         cCtx.fill();
@@ -133,8 +139,8 @@ function createPondGravelTextures(maxAnisotropy: number): {
         cCtx.ellipse(ox, oy, rx, ry, ang, 0, Math.PI * 2);
         cCtx.fill();
 
-        // Mineral highlight fleck on upper pebble crown
-        cCtx.fillStyle = 'rgba(180, 185, 178, 0.18)';
+        // Subtle wet mineral fleck on upper pebble crown
+        cCtx.fillStyle = 'rgba(116, 122, 116, 0.12)';
         cCtx.beginPath();
         cCtx.ellipse(ox - rx * 0.2, oy - ry * 0.2, rx * 0.45, ry * 0.42, ang, 0, Math.PI * 2);
         cCtx.fill();
@@ -162,10 +168,10 @@ function createPondGravelTextures(maxAnisotropy: number): {
     const s = i % 4 === 0 ? 2 : 1;
     cCtx.fillStyle =
       i % 3 === 0
-        ? 'rgba(130, 134, 126, 0.20)'
+        ? 'rgba(92, 98, 92, 0.16)'
         : i % 2 === 0
-          ? 'rgba(72, 68, 58, 0.24)'
-          : 'rgba(8, 11, 13, 0.34)';
+          ? 'rgba(58, 54, 46, 0.24)'
+          : 'rgba(8, 11, 13, 0.36)';
     cCtx.fillRect(x, y, s, s);
     bCtx.fillStyle = i % 2 === 0 ? 'rgba(220, 220, 220, 0.20)' : 'rgba(30, 30, 30, 0.24)';
     bCtx.fillRect(x, y, s, s);
@@ -249,6 +255,17 @@ export function createPondBed(
   bedGeo.computeVertexNormals();
 
   const timeUniform = { value: 0 };
+  const waveTexUniform: { value: THREE.Texture | null } = { value: null };
+  const waveTexelUniform = { value: new THREE.Vector2(1 / 128, 1 / 128) };
+  const pondBoundsUniform = {
+    value: new THREE.Vector4(
+      POND_BOUNDS.minX,
+      POND_BOUNDS.maxX,
+      POND_BOUNDS.minZ,
+      POND_BOUNDS.maxZ,
+    ),
+  };
+  const waterYUniform = { value: waterY };
 
   const attachBedCausticsShader = (
     mat: THREE.MeshStandardMaterial,
@@ -257,6 +274,10 @@ export function createPondBed(
   ) => {
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uCausticTime = timeUniform;
+      shader.uniforms.tWave = waveTexUniform;
+      shader.uniforms.uWaveTexel = waveTexelUniform;
+      shader.uniforms.uPondBounds = pondBoundsUniform;
+      shader.uniforms.uWaterY = waterYUniform;
       shader.vertexShader = shader.vertexShader
         .replace(
           '#include <common>',
@@ -278,48 +299,12 @@ export function createPondBed(
           '#include <common>',
           `#include <common>
           uniform float uCausticTime;
+          uniform sampler2D tWave;
+          uniform vec2 uWaveTexel;
+          uniform vec4 uPondBounds;
+          uniform float uWaterY;
           varying vec3 vBedWorld;
-
-          vec2 bedCausticHash2(vec2 p) {
-            p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
-            return fract(sin(p) * 43758.5453123);
-          }
-
-          float bedVoronoiEdge(vec2 x, float t) {
-            vec2 n = floor(x);
-            vec2 f = fract(x);
-            float d1 = 8.0;
-            float d2 = 8.0;
-            for (int j = -1; j <= 1; j++) {
-              for (int i = -1; i <= 1; i++) {
-                vec2 g = vec2(float(i), float(j));
-                vec2 o = bedCausticHash2(n + g);
-                o = 0.5 + 0.44 * sin(t + 6.2831 * o);
-                vec2 r = g - f + o;
-                float d = dot(r, r);
-                if (d < d1) {
-                  d2 = d1;
-                  d1 = d;
-                } else if (d < d2) {
-                  d2 = d;
-                }
-              }
-            }
-            return pow(clamp(1.0 - abs(sqrt(d2) - sqrt(d1)) * 4.4, 0.0, 1.0), 3.6);
-          }
-
-          float bedCausticArcs(vec2 p, float t) {
-            vec2 warp = vec2(
-              sin(p.y * 1.6 + t * 0.42) + cos(p.x * 1.1 - t * 0.35) * 0.5,
-              cos(p.x * 1.5 - t * 0.38) + sin(p.y * 1.2 + t * 0.31) * 0.5
-            ) * 0.24;
-            float f1 = bedVoronoiEdge((p + warp) * 1.55, t * 0.72);
-            float f2 = bedVoronoiEdge((mat2(0.8, -0.6, 0.6, 0.8) * (p - warp * 0.8)) * 1.95 + vec2(3.7, -2.1), -t * 0.58 + 1.9);
-            float break1 = smoothstep(0.08, 0.68, sin(p.x * 1.85 - p.y * 1.35 + t * 0.28 + sin(p.y * 2.1) * 0.7));
-            float break2 = smoothstep(0.08, 0.68, cos(p.x * 1.55 + p.y * 1.75 - t * 0.24 + cos(p.x * 1.9) * 0.7));
-            float sunPocket = smoothstep(-0.12, 0.52, sin(p.x * 0.85 + t * 0.14) * cos(p.y * 0.95 - t * 0.12));
-            return clamp(f1 * break1 + f2 * break2 * 0.78, 0.0, 1.0) * (0.30 + 0.70 * sunPocket);
-          }`,
+          ${POND_CAUSTICS_GLSL}`,
         );
 
       if (isBedPlane) {
@@ -339,13 +324,15 @@ export function createPondBed(
           DirectionalLightShadow cDirShadow = directionalLightShadows[ 0 ];
           cShadow = receiveShadow ? getShadow( directionalShadowMap[ 0 ], cDirShadow.shadowMapSize, cDirShadow.shadowIntensity, cDirShadow.shadowBias, cDirShadow.shadowRadius, vDirectionalShadowCoord[ 0 ] ) : 1.0;
         #endif
-        float causticRibbons = bedCausticArcs(vBedWorld.xz, uCausticTime * 0.82);
-        float cCenterGlow = exp(-dot(vBedWorld.xz, vBedWorld.xz) * 0.105);
-        // Fine shimmering pale ivory-aqua Voronoi filament ribbons fading cleanly to 0 in corners & shadows
-        reflectedLight.directDiffuse += vec3(0.88, 0.95, 0.89) * (causticRibbons * ${isBedPlane ? '0.205' : '0.155'}) * cCenterGlow * smoothstep(0.08, 0.92, cShadow);`,
+        float waveCaustic = pondWaveLaplacianCaustic(tWave, uWaveTexel, uPondBounds, vBedWorld, uWaterY);
+        float threads = pondAmbientSunThreads(vBedWorld.xz, uCausticTime);
+        float coverMask = pondCausticCoverMask(vBedWorld.xz, cShadow);
+        float cCenterGlow = exp(-dot(vBedWorld.xz, vBedWorld.xz) * 0.085);
+        // Subtle thin broken warm pale-gold sunlight filaments (~0.08-0.13 visible intensity) + live ripple ring shimmer
+        reflectedLight.directDiffuse += vec3(1.0, 0.94, 0.76) * (waveCaustic * ${isBedPlane ? '0.40' : '0.32'} + threads * ${isBedPlane ? '0.24' : '0.18'}) * cCenterGlow * coverMask;`,
       );
     };
-    mat.customProgramCacheKey = () => `${cacheKey}-voronoi-v4`;
+    mat.customProgramCacheKey = () => `${cacheKey}-laplacian-v7`;
   };
 
   const bedMat = new THREE.MeshStandardMaterial({
@@ -381,12 +368,12 @@ export function createPondBed(
   pebblesMesh.castShadow = false;
 
   const mineralPalette = [
-    new THREE.Color('#2a2f32'), // charcoal basalt
-    new THREE.Color('#475156'), // river slate
-    new THREE.Color('#5d5345'), // warm ochre-grey
-    new THREE.Color('#3b4637'), // dark moss stone
-    new THREE.Color('#303b39'), // slate jade
-    new THREE.Color('#666763'), // weathered granite
+    new THREE.Color('#202528'), // basalt charcoal
+    new THREE.Color('#2d3539'), // damp slate
+    new THREE.Color('#3b342b'), // river umber
+    new THREE.Color('#2a352c'), // dark olive-slate
+    new THREE.Color('#263031'), // deep river slate
+    new THREE.Color('#363a37'), // dark river granite
   ];
 
   const hashAt = (n: number, salt: number) => {
@@ -395,6 +382,7 @@ export function createPondBed(
   };
 
   const dummy = new THREE.Object3D();
+  const tmpColor = new THREE.Color();
   let placed = 0;
 
   const tryPlacePebble = (
@@ -427,9 +415,9 @@ export function createPondBed(
     dummy.updateMatrix();
     pebblesMesh.setMatrixAt(placed, dummy.matrix);
 
-    const tint = mineralPalette[placed % mineralPalette.length].clone();
-    tint.offsetHSL((r1 - 0.5) * 0.03, 0, (r3 - 0.5) * 0.07);
-    pebblesMesh.setColorAt(placed, tint);
+    tmpColor.copy(mineralPalette[placed % mineralPalette.length]);
+    tmpColor.offsetHSL((r1 - 0.5) * 0.025, (r2 - 0.5) * 0.03, (r3 - 0.5) * 0.04);
+    pebblesMesh.setColorAt(placed, tmpColor);
     placed++;
   };
 
@@ -534,8 +522,12 @@ export function createPondBed(
     group,
     bedMesh,
     pebblesMesh,
-    update: (elapsedSec: number) => {
+    update: (elapsedSec: number, waterSim?: WaterSimulation) => {
       timeUniform.value = elapsedSec;
+      if (waterSim) {
+        waveTexUniform.value = waterSim.texture;
+        waveTexelUniform.value.copy(waterSim.texelSize);
+      }
     },
     dispose: () => {
       disposables.forEach((d) => d.dispose());

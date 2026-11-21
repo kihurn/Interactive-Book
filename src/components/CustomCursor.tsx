@@ -44,6 +44,18 @@ export function CustomCursor({ sceneInteractive, disabled = false }: CustomCurso
       }
 
       const el = e.target as HTMLElement | null;
+      if (el && el.tagName === 'CANVAS') {
+        if (suppressedRef.current) {
+          suppressedRef.current = false;
+          setSuppressedOverNative(false);
+        }
+        if (htmlInteractiveRef.current) {
+          htmlInteractiveRef.current = false;
+          setHtmlInteractive(false);
+        }
+        return;
+      }
+
       const isNativeField = Boolean(el?.closest('input, textarea, select, iframe'));
       if (isNativeField !== suppressedRef.current) {
         suppressedRef.current = isNativeField;

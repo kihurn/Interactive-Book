@@ -29,7 +29,7 @@ export const POND_BOUNDS = {
 
 export const POND_LAYOUT = {
   waterDepthOffset: 0.108, // slimmer ~32% lower plank profile: waterY = surfaceY - 0.108
-  bedDepthOffset: 0.81,    // pondBedY = surfaceY - 0.81 (= waterY - 0.702)
+  bedDepthOffset: 0.56,    // shallow clear pond bed: pondBedY = surfaceY - 0.56 (= waterY - 0.452)
   plankWidth: 2.51,        // ~85.3% of open book width (2.944) — sleek profile while supporting open book with overhanging corners
   plankDepth: 0.745,       // ~85.2% of open book depth (0.874)
   lanternPos: { x: -1.86, z: -0.34 },
@@ -37,7 +37,7 @@ export const POND_LAYOUT = {
   companionPadPos: { x: -2.06, z: 0.24 },
   emergentBoulders: [
     { id: 'boulder-a', x: 1.66, z: -0.5, radius: 0.29, aboveWater: 0.145, belowWater: 0.165, yaw: 0.45 },
-    { id: 'boulder-b', x: 2.04, z: -0.24, radius: 0.23, aboveWater: 0.115, belowWater: 0.135, yaw: -1.1 },
+    { id: 'boulder-b', x: 2.04, z: -0.24, radius: 0.23, aboveWater: 0.115, belowWater: 0.135, yaw: -0.86 },
     { id: 'boulder-c', x: 1.46, z: -0.84, radius: 0.21, aboveWater: 0.105, belowWater: 0.125, yaw: 1.85 },
   ],
   dripWorldPos: { x: 1.24, z: -0.18 },
@@ -73,10 +73,10 @@ export const OPEN_BOOK_OVERHANG_OBSTACLE: PondObstacleRoundedRect = {
   kind: 'roundedRect',
   id: 'open-book-overhang',
   x: 0,
-  z: 0,
-  halfW: 1.54,
-  halfD: 0.50,
-  cornerRadius: 0.08,
+  z: -0.08,
+  halfW: 1.66,
+  halfD: 0.62,
+  cornerRadius: 0.1,
 };
 
 export const KOI_PAD_OBSTACLES: PondObstacleCircle[] = [
@@ -135,6 +135,21 @@ export function signedDistanceToObstacle(
   return Math.hypot(Math.max(qx, 0), Math.max(qz, 0)) + Math.min(Math.max(qx, qz), 0) - obs.cornerRadius;
 }
 
+const OBSTACLES_BASE: readonly PondObstacle[] = POND_OBSTACLES;
+const OBSTACLES_BOOK: readonly PondObstacle[] = [
+  ...POND_OBSTACLES,
+  OPEN_BOOK_OVERHANG_OBSTACLE,
+];
+const OBSTACLES_PADS: readonly PondObstacle[] = [
+  ...POND_OBSTACLES,
+  ...KOI_PAD_OBSTACLES,
+];
+const OBSTACLES_BOOK_AND_PADS: readonly PondObstacle[] = [
+  ...POND_OBSTACLES,
+  OPEN_BOOK_OVERHANG_OBSTACLE,
+  ...KOI_PAD_OBSTACLES,
+];
+
 export function nearestObstacleSeparation(
   worldX: number,
   worldZ: number,
@@ -146,23 +161,42 @@ export function nearestObstacleSeparation(
   let bestNx = 0;
   let bestNz = 1;
 
-  const list: PondObstacle[] = [...POND_OBSTACLES];
-  if (includeOpenBookOverhang) {
-    list.push(OPEN_BOOK_OVERHANG_OBSTACLE);
-  }
-  if (includeLilyPads) {
-    list.push(...KOI_PAD_OBSTACLES);
-  }
+  const list = includeOpenBookOverhang
+    ? includeLilyPads
+      ? OBSTACLES_BOOK_AND_PADS
+      : OBSTACLES_BOOK
+    : includeLilyPads
+      ? OBSTACLES_PADS
+      : OBSTACLES_BASE;
 
-  for (const obs of list) {
+  for (let i = 0; i < list.length; i++) {
+    const obs = list[i];
     const d = signedDistanceToObstacle(worldX, worldZ, obs) - extraMargin;
     if (d < bestDist) {
       bestDist = d;
       const vx = worldX - obs.x;
       const vz = worldZ - obs.z;
-      const mag = Math.hypot(vx, vz) || 1;
-      bestNx = vx / mag;
-      bestNz = vz / mag;
+      if (obs.kind === 'circle') {
+        const mag = Math.hypot(vx, vz) || 1;
+        bestNx = vx / mag;
+        bestNz = vz / mag;
+      } else {
+        const bx = Math.max(0, obs.halfW - obs.cornerRadius);
+        const bz = Math.max(0, obs.halfD - obs.cornerRadius);
+        const qx = Math.abs(vx) - bx;
+        const qz = Math.abs(vz) - bz;
+        if (qx > 0 && qz > 0) {
+          const mag = Math.hypot(qx, qz) || 1;
+          bestNx = (Math.sign(vx) * qx) / mag;
+          bestNz = (Math.sign(vz) * qz) / mag;
+        } else if (qx > qz) {
+          bestNx = Math.sign(vx) || 1;
+          bestNz = 0;
+        } else {
+          bestNx = 0;
+          bestNz = Math.sign(vz) || 1;
+        }
+      }
     }
   }
 

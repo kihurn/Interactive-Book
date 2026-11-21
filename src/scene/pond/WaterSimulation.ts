@@ -144,9 +144,10 @@ export class WaterSimulation {
   private elapsedSec = 0;
   private stepAccumulator = 0;
   private impulses: CpuWaveImpulse[] = [];
+  private cpuWaveResult = { height: 0, slopeX: 0, slopeZ: 0 };
 
-  constructor(isSoftwareGl: boolean) {
-    this.resolution = isSoftwareGl ? 256 : 384;
+  constructor(_isSoftwareGl: boolean) {
+    this.resolution = 256;
     this.texelSize = new THREE.Vector2(1 / this.resolution, 1 / this.resolution);
 
     const opts: THREE.RenderTargetOptions = {
@@ -356,7 +357,10 @@ export class WaterSimulation {
       }
     }
 
-    return { height, slopeX, slopeZ };
+    this.cpuWaveResult.height = height;
+    this.cpuWaveResult.slopeX = slopeX;
+    this.cpuWaveResult.slopeZ = slopeZ;
+    return this.cpuWaveResult;
   }
 
   public getRecentImpulses(): readonly CpuWaveImpulse[] {

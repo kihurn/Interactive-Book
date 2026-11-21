@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { POND_CAUSTICS_GLSL } from './causticsShader';
 import { POND_BOUNDS, POND_LAYOUT } from './constants';
 import type { WaterSimulation } from './WaterSimulation';
 
@@ -87,9 +88,12 @@ export function createWaterSurface(
     depthWrite: true,
   });
 
+  let compiledWaveUniform: THREE.IUniform | null = null;
+
   waterMat.onBeforeCompile = (shader) => {
     waterMat.userData.shader = shader;
     Object.assign(shader.uniforms, uniforms);
+    compiledWaveUniform = shader.uniforms.tWave ?? null;
 
     shader.vertexShader = shader.vertexShader
       .replace(
@@ -141,51 +145,7 @@ export function createWaterSurface(
         varying vec2 vWaterUv;
         varying vec3 vWaterWorld;
 
-        float waterSdRoundedBox(vec2 p, vec2 b, float r) {
-          vec2 q = abs(p) - b + vec2(r);
-          return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-        }
-
-        vec2 waterCausticHash2(vec2 p) {
-          p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
-          return fract(sin(p) * 43758.5453123);
-        }
-
-        float waterVoronoiEdge(vec2 x, float t) {
-          vec2 n = floor(x);
-          vec2 f = fract(x);
-          float d1 = 8.0;
-          float d2 = 8.0;
-          for (int j = -1; j <= 1; j++) {
-            for (int i = -1; i <= 1; i++) {
-              vec2 g = vec2(float(i), float(j));
-              vec2 o = waterCausticHash2(n + g);
-              o = 0.5 + 0.44 * sin(t + 6.2831 * o);
-              vec2 r = g - f + o;
-              float d = dot(r, r);
-              if (d < d1) {
-                d2 = d1;
-                d1 = d;
-              } else if (d < d2) {
-                d2 = d;
-              }
-            }
-          }
-          return pow(clamp(1.0 - abs(sqrt(d2) - sqrt(d1)) * 4.4, 0.0, 1.0), 3.6);
-        }
-
-        float waterCausticShimmer(vec2 p, float t) {
-          vec2 warp = vec2(
-            sin(p.y * 1.6 + t * 0.42) + cos(p.x * 1.1 - t * 0.35) * 0.5,
-            cos(p.x * 1.5 - t * 0.38) + sin(p.y * 1.2 + t * 0.31) * 0.5
-          ) * 0.24;
-          float f1 = waterVoronoiEdge((p + warp) * 1.55, t * 0.72);
-          float f2 = waterVoronoiEdge((mat2(0.8, -0.6, 0.6, 0.8) * (p - warp * 0.8)) * 1.95 + vec2(3.7, -2.1), -t * 0.58 + 1.9);
-          float break1 = smoothstep(0.08, 0.68, sin(p.x * 1.85 - p.y * 1.35 + t * 0.28 + sin(p.y * 2.1) * 0.7));
-          float break2 = smoothstep(0.08, 0.68, cos(p.x * 1.55 + p.y * 1.75 - t * 0.24 + cos(p.x * 1.9) * 0.7));
-          float sunPocket = smoothstep(-0.12, 0.52, sin(p.x * 0.85 + t * 0.14) * cos(p.y * 0.95 - t * 0.12));
-          return clamp(f1 * break1 + f2 * break2 * 0.78, 0.0, 1.0) * (0.30 + 0.70 * sunPocket);
-        }`,
+        ${POND_CAUSTICS_GLSL}`,
       )
       .replace(
         '#include <normal_fragment_maps>',
@@ -230,15 +190,15 @@ export function createWaterSurface(
           texture2D(tUnderwater, wUvB).b
         );
 
-        // 2. Clearer deep jade-slate water absorption gradient so submerged koi and gravel stay luminous
+        // 2. Clearer shallow jade-slate water absorption gradient so pond floor, base stones, and koi stay luminous
         float wRadialFade = exp(-dot(vWaterWorld.xz, vWaterWorld.xz) * 0.055);
-        vec3 wDeepTint = mix(vec3(0.008, 0.022, 0.024), vec3(0.018, 0.056, 0.054), wRadialFade);
-        vec3 wTransmitted = mix(wUnderwater, wDeepTint, mix(0.36, 0.11, wRadialFade));
+        vec3 wDeepTint = mix(vec3(0.010, 0.026, 0.028), vec3(0.020, 0.060, 0.058), wRadialFade);
+        vec3 wTransmitted = mix(wUnderwater, wDeepTint, mix(0.30, 0.07, wRadialFade));
 
         // 3. Real directional soft shadow cast onto water surface + meniscus contact occlusion
         wTransmitted *= mix(0.48, 1.0, waterShadow);
 
-        float wDBook = waterSdRoundedBox(vWaterWorld.xz, uBookShadowHalfSize, 0.04);
+        float wDBook = pondSdRoundedBox(vWaterWorld.xz, uBookShadowHalfSize, 0.04);
         float wBookOcc = smoothstep(-0.08, 0.22, wDBook);
         wTransmitted *= mix(0.64, 1.0, wBookOcc);
 
@@ -250,32 +210,33 @@ export function createWaterSurface(
         float wLotusOcc = smoothstep(-0.04, 0.10, wDLotusPad);
         wTransmitted *= mix(0.58, 1.0, wLotusOcc);
 
-        // 4. Crisp dynamic Laplacian wave-crest caustics + trough darkening (pale ivory-aqua shimmer, never milky)
-        float wLaplacian = clamp(((wHL + wHR + wHU + wHD) * 0.25 - wHC) * 32.0, -0.65, 1.25);
-        float wCrestLight = pow(max(0.0, wLaplacian), 2.1);
-        float wTroughDark = max(0.0, -wLaplacian);
+        // 4. Wave-driven convex-crest Laplacian caustics + softened trough darkening + thin warm pale-gold filaments
+        float wFocus = (wHC - (wHL + wHR + wHU + wHD) * 0.25) * 40.0;
+        float wCrestLight = pow(clamp(wFocus, 0.0, 1.25), 1.55);
+        float wTroughDark = clamp(-wFocus, 0.0, 0.36);
         float wSlopeMag = length(wWorldN.xz);
-        float wShimmer = waterCausticShimmer(vWaterWorld.xz + wSafeSlope * 0.42, uTime * 0.82);
-        wTransmitted *= (1.0 - min(0.62, wTroughDark * 0.58));
-        wTransmitted += vec3(0.048, 0.068, 0.062) * (wCrestLight * 0.72 + wShimmer * 0.065 * wRadialFade) * smoothstep(0.08, 0.92, waterShadow);
+        float wThreads = pondAmbientSunThreads(vWaterWorld.xz + wSafeSlope * 0.30, uTime);
+        float wCover = pondCausticCoverMask(vWaterWorld.xz, waterShadow) * wBookOcc;
+        wTransmitted *= (1.0 - min(0.32, wTroughDark * 0.42));
+        wTransmitted += (vec3(0.11, 0.10, 0.075) * wCrestLight + vec3(1.0, 0.94, 0.76) * (wThreads * 0.042)) * wCover;
 
         // 5. Subtle directional Fresnel sheen + narrow optical ripple-crest highlights (preserves water transparency)
         vec3 wV = normalize(uCameraPos - vWaterWorld);
         float wFresnel = 0.015 + 0.985 * pow(1.0 - max(dot(wWorldN, wV), 0.0), 5.2);
         float wSunFacing = clamp(dot(wWorldN.xz, normalize(uSunDir.xz)) * 2.4 + 0.35, 0.0, 1.0);
-        vec3 wSkyReflect = mix(vec3(0.005, 0.014, 0.017), vec3(0.024, 0.048, 0.052), wSunFacing);
-        wTransmitted = mix(wTransmitted, wSkyReflect, wFresnel * (0.20 + 0.34 * clamp(wSlopeMag * 2.4, 0.0, 1.0)));
+        vec3 wSkyReflect = mix(vec3(0.014, 0.032, 0.036), vec3(0.034, 0.064, 0.066), wSunFacing);
+        wTransmitted = mix(wTransmitted, wSkyReflect, wFresnel * (0.14 + 0.26 * clamp(wSlopeMag * 2.2, 0.0, 1.0)));
 
         // Narrow optical rim along crisp wave slopes facing key light
-        float wSlopeRim = smoothstep(0.028, 0.15, wSlopeMag) * (0.30 + 0.70 * wSunFacing);
-        wTransmitted += vec3(0.018, 0.036, 0.034) * wSlopeRim * mix(0.35, 1.0, waterShadow);
+        float wSlopeRim = smoothstep(0.024, 0.14, wSlopeMag) * (0.30 + 0.70 * wSunFacing);
+        wTransmitted += vec3(0.024, 0.044, 0.040) * wSlopeRim * mix(0.45, 1.0, waterShadow);
 
         // Sharp high-exponent sunlight glints riding narrow ripple crests (masked by real bamboo/book shadows)
         vec3 wLsun = normalize(uSunDir);
         vec3 wHsun = normalize(wLsun + wV);
-        float wSunBroad = pow(max(dot(wWorldN, wHsun), 0.0), 92.0);
-        float wSunCrisp = pow(max(dot(wWorldN, wHsun), 0.0), 260.0);
-        wTransmitted += vec3(0.84, 0.93, 0.89) * (wSunBroad * 0.14 + wSunCrisp * 0.72) * waterShadow * wBookOcc * smoothstep(0.008, 0.045, wSlopeMag);
+        float wSunBroad = pow(max(dot(wWorldN, wHsun), 0.0), 86.0);
+        float wSunCrisp = pow(max(dot(wWorldN, wHsun), 0.0), 240.0);
+        wTransmitted += vec3(0.88, 0.95, 0.89) * (wSunBroad * 0.18 + wSunCrisp * 0.78) * waterShadow * wBookOcc * smoothstep(0.006, 0.042, wSlopeMag);
 
         // 6. Warm amber Yukimi-doro lantern rim reflections along open-water ripple crests
         vec3 wToLantern = normalize(uLanternPos - vWaterWorld);
@@ -294,7 +255,7 @@ export function createWaterSurface(
         totalEmissiveRadiance += wTransmitted;`,
       );
   };
-  waterMat.customProgramCacheKey = () => 'pond-water-standard-shadow-v8';
+  waterMat.customProgramCacheKey = () => 'pond-water-standard-laplacian-v11';
 
   const waterMesh = new THREE.Mesh(waterGeo, waterMat);
   waterMesh.name = 'pond-water-surface';
@@ -304,6 +265,7 @@ export function createWaterSurface(
   waterMesh.renderOrder = 1;
 
   const tmpSize = new THREE.Vector2();
+  const prevVis: boolean[] = [];
 
   return {
     waterMesh,
@@ -328,27 +290,30 @@ export function createWaterSurface(
       );
       uniforms.uCardPos.value.set(cardPos.x, cardPos.z);
 
-      const compiledShader = waterMat.userData.shader as
-        | { uniforms?: Record<string, THREE.IUniform> }
-        | undefined;
-      if (compiledShader?.uniforms?.tWave) {
-        compiledShader.uniforms.tWave.value = waveTex;
+      if (compiledWaveUniform) {
+        compiledWaveUniform.value = waveTex;
       }
     },
     renderUnderwater: (renderer, scene, camera, aboveWaterObjects) => {
       renderer.getDrawingBufferSize(tmpSize);
-      if (tmpSize.x > 0 && tmpSize.y > 0) {
+      if (
+        tmpSize.x > 0 &&
+        tmpSize.y > 0 &&
+        (uniforms.uResolution.value.x !== tmpSize.x ||
+          uniforms.uResolution.value.y !== tmpSize.y)
+      ) {
         uniforms.uResolution.value.copy(tmpSize);
       }
 
       const prevTarget = renderer.getRenderTarget();
       const prevShadowAuto = renderer.shadowMap.autoUpdate;
       const prevShadowNeeds = renderer.shadowMap.needsUpdate;
-      const prevVis = aboveWaterObjects.map((obj) => obj.visible);
+      const len = aboveWaterObjects.length;
       const prevWaterVis = waterMesh.visible;
 
       waterMesh.visible = false;
-      for (let i = 0; i < aboveWaterObjects.length; i++) {
+      for (let i = 0; i < len; i++) {
+        prevVis[i] = aboveWaterObjects[i].visible;
         aboveWaterObjects[i].visible = false;
       }
 
@@ -363,7 +328,7 @@ export function createWaterSurface(
       renderer.shadowMap.autoUpdate = prevShadowAuto;
       renderer.shadowMap.needsUpdate = prevShadowNeeds;
       waterMesh.visible = prevWaterVis;
-      for (let i = 0; i < aboveWaterObjects.length; i++) {
+      for (let i = 0; i < len; i++) {
         aboveWaterObjects[i].visible = prevVis[i];
       }
     },

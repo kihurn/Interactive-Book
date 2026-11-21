@@ -1,6 +1,9 @@
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { POND_LAYOUT } from './constants';
 import type { WaterSimulation } from './WaterSimulation';
+
+const noopRaycast = () => {};
 
 export interface FloatingPlankRig {
   group: THREE.Group;
@@ -576,18 +579,45 @@ export function createFloatingPlank(
     [-1.08, 0.24],
     [1.05, -0.23],
   ];
+  const scratchObj = new THREE.Object3D();
+  const socketParts: THREE.BufferGeometry[] = [];
+  const pegParts: THREE.BufferGeometry[] = [];
   pegPositions.forEach(([px, pz]) => {
-    const socket = new THREE.Mesh(socketGeo, socketMat);
-    socket.position.set(px, surfaceY - 0.0005, pz);
-    socket.receiveShadow = true;
-    aboveWaterGroup.add(socket);
+    scratchObj.position.set(px, surfaceY - 0.0005, pz);
+    scratchObj.rotation.set(0, 0, 0);
+    scratchObj.scale.set(1, 1, 1);
+    scratchObj.updateMatrix();
+    const sPart = socketGeo.clone();
+    sPart.applyMatrix4(scratchObj.matrix);
+    socketParts.push(sPart);
 
-    const peg = new THREE.Mesh(pegGeo, ironPegMat);
-    peg.position.set(px, surfaceY - 0.001, pz);
-    peg.receiveShadow = true;
-    peg.castShadow = true;
-    aboveWaterGroup.add(peg);
+    scratchObj.position.set(px, surfaceY - 0.001, pz);
+    scratchObj.updateMatrix();
+    const pPart = pegGeo.clone();
+    pPart.applyMatrix4(scratchObj.matrix);
+    pegParts.push(pPart);
   });
+
+  const mergedSocketsGeo = mergeGeometries(socketParts, false);
+  socketParts.forEach((g) => g.dispose());
+  if (mergedSocketsGeo) {
+    const socketsMesh = new THREE.Mesh(mergedSocketsGeo, socketMat);
+    socketsMesh.receiveShadow = true;
+    socketsMesh.raycast = noopRaycast;
+    aboveWaterGroup.add(socketsMesh);
+    disposables.push(mergedSocketsGeo);
+  }
+
+  const mergedPegsGeo = mergeGeometries(pegParts, false);
+  pegParts.forEach((g) => g.dispose());
+  if (mergedPegsGeo) {
+    const pegsMesh = new THREE.Mesh(mergedPegsGeo, ironPegMat);
+    pegsMesh.receiveShadow = true;
+    pegsMesh.castShadow = true;
+    pegsMesh.raycast = noopRaycast;
+    aboveWaterGroup.add(pegsMesh);
+    disposables.push(mergedPegsGeo);
+  }
 
   // Low-profile creeping velvety moss mats hugging outer plank seams & splintered wet ends (outside book footprint)
   const tuftGeos = [
@@ -610,17 +640,27 @@ export function createFloatingPlank(
     { x: 0.92, y: surfaceY - 0.006, z: 0.352, sx: 0.116, sy: 0.028, sz: 0.052, yaw: 0.12 },
   ];
 
+  const mossBucketParts: THREE.BufferGeometry[][] = mossMats.map(() => []);
   tuftClusters.forEach((tc, idx) => {
-    const tMesh = new THREE.Mesh(
-      tuftGeos[idx % tuftGeos.length],
-      mossMats[idx % mossMats.length],
-    );
-    tMesh.position.set(tc.x, tc.y, tc.z);
-    tMesh.scale.set(tc.sx, tc.sy, tc.sz);
-    tMesh.rotation.y = tc.yaw;
-    tMesh.castShadow = true;
-    tMesh.receiveShadow = true;
-    aboveWaterGroup.add(tMesh);
+    scratchObj.position.set(tc.x, tc.y, tc.z);
+    scratchObj.rotation.set(0, tc.yaw, 0);
+    scratchObj.scale.set(tc.sx, tc.sy, tc.sz);
+    scratchObj.updateMatrix();
+    const part = tuftGeos[idx % tuftGeos.length].clone();
+    part.applyMatrix4(scratchObj.matrix);
+    mossBucketParts[idx % mossMats.length].push(part);
+  });
+  mossBucketParts.forEach((parts, matIdx) => {
+    if (parts.length === 0) return;
+    const mergedMossGeo = mergeGeometries(parts, false);
+    parts.forEach((g) => g.dispose());
+    if (!mergedMossGeo) return;
+    const mossMesh = new THREE.Mesh(mergedMossGeo, mossMats[matIdx]);
+    mossMesh.castShadow = true;
+    mossMesh.receiveShadow = true;
+    mossMesh.raycast = noopRaycast;
+    aboveWaterGroup.add(mossMesh);
+    disposables.push(mergedMossGeo);
   });
 
   // Subtle isolated contact shadow catcher strictly beneath book footprint
@@ -636,6 +676,7 @@ export function createFloatingPlank(
   bookShadow.position.y = surfaceY + 0.0014;
   bookShadow.receiveShadow = true;
   bookShadow.renderOrder = 2;
+  bookShadow.raycast = noopRaycast;
   aboveWaterGroup.add(bookShadow);
 
   disposables.push(

@@ -2,7 +2,8 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import * as SkeletonUtils from 'three/examples/jsm/utils/SkeletonUtils.js';
-import { nearestObstacleSeparation, POND_LAYOUT } from './constants';
+import { nearestObstacleSeparation, POND_BOUNDS, POND_LAYOUT } from './constants';
+import { POND_CAUSTICS_GLSL } from './causticsShader';
 import type { WaterSimulation } from './WaterSimulation';
 
 export const MODEL_YAW_OFFSET = 0;
@@ -24,17 +25,17 @@ export interface KoiSchoolRig {
  * 1: Deep Crimson Kohaku (vivid scarlet spots on pearl white)
  * 2: Shiro Utsuri (deep velvety sumi ink-black on pearl white)
  * 3: Showa (3D object-space noise splitting spots between sumi ink-black & crimson-red on white)
- * 4: Yamabuki Ogon (warm metallic gold body wash with burnished amber-gold spot shading)
- * 5: Platinum Ogon (desaturated luminous silver-pearl white)
+ * 4: Ki Utsuri (warm golden-amber body with bold velvety sumi ink-black patches)
+ * 5: Yamabuki Hariwake (luminous pearl white with vivid saffron-gold patches)
  */
 export type KoiVarietyId = 0 | 1 | 2 | 3 | 4 | 5;
 
-interface KoiWaypoint {
+export interface KoiWaypoint {
   x: number;
   z: number;
 }
 
-interface KoiSpec {
+export interface KoiSpec {
   variety: KoiVarietyId;
   scaleVar: number; // ~0.85x - 1.15x subtle size variation
   length: number;
@@ -47,12 +48,8 @@ interface KoiSpec {
   waypoints: KoiWaypoint[];
 }
 
-interface KoiAgent {
+export interface KoiMotionState {
   spec: KoiSpec;
-  root: THREE.Group;
-  shadowDisc: THREE.Mesh;
-  mixer: THREE.AnimationMixer | null;
-  action: THREE.AnimationAction | null;
   x: number;
   z: number;
   vx: number;
@@ -61,8 +58,140 @@ interface KoiAgent {
   speed: number;
   burst: number;
   turnBend: number;
+  swimPhase: number;
   wanderPhase: number;
   waypointIndex: number;
+  anchorX: number;
+  anchorZ: number;
+  stuckTimer: number;
+  evadeTimer: number;
+  evadeYaw: number;
+}
+
+export const KOI_PATROL_SPECS: KoiSpec[] = [
+  // North Lagoon (3 staggered shallow depth layers: 0.065, 0.125, 0.185)
+  {
+    variety: 3, // Showa
+    scaleVar: 1.02,
+    length: 0.44,
+    depthOffset: 0.065,
+    baseSpeed: 0.145,
+    initX: -0.95,
+    initZ: -1.14,
+    initYaw: 1.35,
+    phase: 0.4,
+    waypoints: [
+      { x: -0.25, z: -1.24 },
+      { x: 0.72, z: -1.18 },
+      { x: 0.88, z: -1.03 },
+      { x: 0.15, z: -1.02 },
+      { x: -0.78, z: -1.04 },
+      { x: -1.12, z: -1.18 },
+    ],
+  },
+  {
+    variety: 2, // Shiro Utsuri
+    scaleVar: 0.98,
+    length: 0.46,
+    depthOffset: 0.125,
+    baseSpeed: 0.155,
+    initX: 0.72,
+    initZ: -1.12,
+    initYaw: -1.65,
+    phase: 2.1,
+    waypoints: [
+      { x: -0.1, z: -1.03 },
+      { x: -0.98, z: -1.08 },
+      { x: -1.24, z: -1.22 },
+      { x: -0.52, z: -1.32 },
+      { x: 0.45, z: -1.26 },
+      { x: 0.88, z: -1.12 },
+    ],
+  },
+  {
+    variety: 5, // Yamabuki Hariwake (pearl white + vivid saffron-gold patches)
+    scaleVar: 0.95,
+    length: 0.42,
+    depthOffset: 0.185,
+    baseSpeed: 0.14,
+    initX: -0.35,
+    initZ: -1.28,
+    initYaw: 0.95,
+    phase: 4.3,
+    waypoints: [
+      { x: 0.35, z: -1.32 },
+      { x: 0.84, z: -1.2 },
+      { x: 0.46, z: -1.05 },
+      { x: -0.45, z: -1.04 },
+      { x: -1.08, z: -1.14 },
+      { x: -0.88, z: -1.29 },
+    ],
+  },
+  // South Lagoon (3 staggered shallow depth layers: 0.065, 0.125, 0.185)
+  {
+    variety: 0, // Kohaku
+    scaleVar: 1.04,
+    length: 0.48,
+    depthOffset: 0.065,
+    baseSpeed: 0.15,
+    initX: -0.72,
+    initZ: 0.94,
+    initYaw: 1.48,
+    phase: 1.15,
+    waypoints: [
+      { x: 0.05, z: 0.9 },
+      { x: 0.84, z: 0.92 },
+      { x: 0.98, z: 1.06 },
+      { x: 0.32, z: 1.1 },
+      { x: -0.58, z: 1.08 },
+      { x: -0.98, z: 0.96 },
+    ],
+  },
+  {
+    variety: 1, // Deep Crimson Kohaku
+    scaleVar: 0.96,
+    length: 0.45,
+    depthOffset: 0.125,
+    baseSpeed: 0.16,
+    initX: 0.68,
+    initZ: 1.02,
+    initYaw: -1.72,
+    phase: 3.25,
+    waypoints: [
+      { x: -0.15, z: 1.09 },
+      { x: -0.92, z: 1.04 },
+      { x: -1.0, z: 0.89 },
+      { x: -0.28, z: 0.87 },
+      { x: 0.56, z: 0.88 },
+      { x: 0.94, z: 0.98 },
+    ],
+  },
+  {
+    variety: 4, // Ki Utsuri (warm gold + bold sumi ink-black patches)
+    scaleVar: 1.0,
+    length: 0.43,
+    depthOffset: 0.185,
+    baseSpeed: 0.145,
+    initX: -0.05,
+    initZ: 1.06,
+    initYaw: 1.22,
+    phase: 5.1,
+    waypoints: [
+      { x: 0.64, z: 1.08 },
+      { x: 0.96, z: 0.95 },
+      { x: 0.42, z: 0.87 },
+      { x: -0.45, z: 0.88 },
+      { x: -0.96, z: 0.98 },
+      { x: -0.62, z: 1.1 },
+    ],
+  },
+];
+
+interface KoiAgent extends KoiMotionState {
+  root: THREE.Group;
+  shadowDisc: THREE.Mesh;
+  mixer: THREE.AnimationMixer | null;
+  action: THREE.AnimationAction | null;
   timeUniform: { value: number };
   freqUniform: { value: number };
   bendUniform: { value: number };
@@ -105,41 +234,61 @@ async function fetchKoiGlbBuffer(): Promise<ArrayBuffer> {
   throw new Error('Unable to locate valid koi.glb asset');
 }
 
+function wrapAngleRad(a: number): number {
+  let r = a;
+  while (r > Math.PI) r -= Math.PI * 2;
+  while (r < -Math.PI) r += Math.PI * 2;
+  return r;
+}
+
 /**
- * Fits a smooth 4-coefficient cubic polynomial x(zn) = a0 + a1*zn + a2*zn^2 + a3*zn^3 via IRLS
- * (Gaussian kernel-density / Huber reweighting) over normalized slice coordinates zn in [-1, 1].
+ * Fits a single smooth circular arc (x - cx)^2 + (z - cz)^2 = R^2 in the XZ plane via
+ * Huber-reweighted IRLS over core body cross-section samples so lateral pectoral fins don't pull the spine.
  */
-function fitCubicIRLS(samples: Array<{ zn: number; x: number; w: number }>): [number, number, number, number] | null {
+function fitCircleIRLS(
+  samples: Array<{ x: number; z: number; w: number }>,
+): { cx: number; cz: number; R: number } | null {
   if (samples.length < 6) return null;
-  let coef: [number, number, number, number] = [0, 0, 0, 0];
-  const weights = samples.map((s) => s.w);
+  let weights = samples.map((s) => s.w);
+  let cx = 0;
+  let cz = 0;
+  let R = 1;
 
-  for (let iter = 0; iter < 6; iter++) {
-    // Build 4x4 normal equations A^T W A c = A^T W y
-    const mat = [
-      [0, 0, 0, 0, 0],
-      [0, 0, 0, 0, 0],
-      [0, 0, 0, 0, 0],
-      [0, 0, 0, 0, 0],
-    ];
+  for (let iter = 0; iter < 8; iter++) {
+    let sxx = 0;
+    let sxz = 0;
+    let sx1 = 0;
+    let szz = 0;
+    let sz1 = 0;
+    let s11 = 0;
+    let sxy = 0;
+    let szy = 0;
+    let s1y = 0;
+
     for (let i = 0; i < samples.length; i++) {
-      const { zn, x } = samples[i];
-      const w = weights[i];
-      const basis = [1, zn, zn * zn, zn * zn * zn];
-      for (let r = 0; r < 4; r++) {
-        for (let c = 0; c < 4; c++) {
-          mat[r][c] += w * basis[r] * basis[c];
-        }
-        mat[r][4] += w * basis[r] * x;
-      }
+      const { x, z } = samples[i];
+      const wi = weights[i];
+      const y = x * x + z * z;
+      sxx += wi * x * x;
+      sxz += wi * x * z;
+      sx1 += wi * x;
+      szz += wi * z * z;
+      sz1 += wi * z;
+      s11 += wi;
+      sxy += wi * x * y;
+      szy += wi * z * y;
+      s1y += wi * y;
     }
-    // Slight ridge regularization for conditioning
-    for (let r = 0; r < 4; r++) mat[r][r] += 1e-6;
 
-    // Gaussian elimination with partial pivoting
-    for (let col = 0; col < 4; col++) {
+    const mat = [
+      [sxx + 1e-6, sxz, sx1, sxy],
+      [sxz, szz + 1e-6, sz1, szy],
+      [sx1, sz1, s11 + 1e-6, s1y],
+    ];
+
+    for (let col = 0; col < 3; col++) {
       let pivotRow = col;
-      for (let r = col + 1; r < 4; r++) {
+      for (let r = col + 1; r < 3; r++) {
         if (Math.abs(mat[r][col]) > Math.abs(mat[pivotRow][col])) pivotRow = r;
       }
       if (pivotRow !== col) {
@@ -149,35 +298,357 @@ function fitCubicIRLS(samples: Array<{ zn: number; x: number; w: number }>): [nu
       }
       const diag = mat[col][col];
       if (Math.abs(diag) < 1e-10) return null;
-      for (let c = col; c < 5; c++) mat[col][c] /= diag;
-      for (let r = 0; r < 4; r++) {
+      for (let c = col; c < 4; c++) mat[col][c] /= diag;
+      for (let r = 0; r < 3; r++) {
         if (r === col) continue;
         const factor = mat[r][col];
-        for (let c = col; c < 5; c++) {
+        for (let c = col; c < 4; c++) {
           mat[r][c] -= factor * mat[col][c];
         }
       }
     }
-    coef = [mat[0][4], mat[1][4], mat[2][4], mat[3][4]];
 
-    // Reweight residuals robustly (Huber / Tukey-style falloff) so pectoral fin outliers don't pull the spine
-    for (let i = 0; i < samples.length; i++) {
-      const { zn, x, w } = samples[i];
-      const pred = coef[0] + coef[1] * zn + coef[2] * zn * zn + coef[3] * zn * zn * zn;
-      const err = Math.abs(x - pred);
-      const huber = err <= 0.06 ? 1 : 0.06 / Math.max(0.06, err);
-      weights[i] = w * huber;
-    }
+    cx = mat[0][3] * 0.5;
+    cz = mat[1][3] * 0.5;
+    const rSq = mat[2][3] + cx * cx + cz * cz;
+    if (rSq <= 1e-6) return null;
+    R = Math.sqrt(rSq);
+
+    const huberThresh = Math.max(0.02, R * 0.045);
+    weights = samples.map((s) => {
+      const err = Math.abs(Math.hypot(s.x - cx, s.z - cz) - R);
+      const huber = err <= huberThresh ? 1 : huberThresh / err;
+      return s.w * huber;
+    });
   }
-  return coef;
+
+  return { cx, cz, R };
 }
 
 /**
- * Un-bends a frozen C-curved koi BufferGeometry in the XZ plane onto a straight +Z spine
- * (snout +Z, tail -Z, dorsal +Y preserved), allocating fresh Float32BufferAttributes so
- * KHR_mesh_quantization Int16/Int8 buffers are never mutated in-place.
+ * Weighted IRLS fit of a quadratic polynomial y(u) = c0 + c1*u + c2*u^2.
  */
-function straightenKoiGeometry(geometry: THREE.BufferGeometry): void {
+function fitQuadraticIRLS(
+  samples: Array<{ u: number; r: number; w: number }>,
+  fallbackR: number,
+  huberScale?: number,
+): { c0: number; c1: number; c2: number } {
+  if (samples.length < 6) return { c0: fallbackR, c1: 0, c2: 0 };
+  let weights = samples.map((s) => s.w);
+  let c0 = fallbackR;
+  let c1 = 0;
+  let c2 = 0;
+
+  for (let iter = 0; iter < 6; iter++) {
+    const A = [
+      [0, 0, 0, 0],
+      [0, 0, 0, 0],
+      [0, 0, 0, 0],
+    ];
+    for (let i = 0; i < samples.length; i++) {
+      const { u, r } = samples[i];
+      const wi = weights[i];
+      const basis = [1, u, u * u];
+      for (let row = 0; row < 3; row++) {
+        for (let col = 0; col < 3; col++) {
+          A[row][col] += wi * basis[row] * basis[col];
+        }
+        A[row][3] += wi * basis[row] * r;
+      }
+    }
+
+    for (let col = 0; col < 3; col++) {
+      let piv = col;
+      for (let r = col + 1; r < 3; r++) {
+        if (Math.abs(A[r][col]) > Math.abs(A[piv][col])) piv = r;
+      }
+      if (piv !== col) {
+        const tmp = A[col];
+        A[col] = A[piv];
+        A[piv] = tmp;
+      }
+      const diag = A[col][col];
+      if (Math.abs(diag) < 1e-10) return { c0: fallbackR, c1: 0, c2: 0 };
+      for (let k = col; k < 4; k++) A[col][k] /= diag;
+      for (let r = 0; r < 3; r++) {
+        if (r === col) continue;
+        const f = A[r][col];
+        for (let k = col; k < 4; k++) A[r][k] -= f * A[col][k];
+      }
+    }
+
+    c0 = A[0][3];
+    c1 = A[1][3];
+    c2 = A[2][3];
+    const huberThresh = Math.max(1e-4, huberScale ?? Math.abs(fallbackR) * 0.03);
+    weights = samples.map((s) => {
+      const err = Math.abs(s.r - (c0 + c1 * s.u + c2 * s.u * s.u));
+      const h = err <= huberThresh ? 1 : huberThresh / err;
+      return s.w * h;
+    });
+  }
+
+  return { c0, c1, c2 };
+}
+
+/**
+ * Recursively traverses the koi.glb hierarchy, computes each mesh's worldMatrix from parent
+ * transforms down, bakes worldMatrix into cloned Float32-promoted BufferGeometries, resets all
+ * parent/node transforms to identity, and ensures consistent +Y dorsal-up & +Z length orientation.
+ */
+export function bakeKoiSceneTransforms(rawScene: THREE.Object3D): THREE.Group {
+  const bakedRoot = new THREE.Group();
+  bakedRoot.name = 'koi-baked-upright-root';
+
+  const promoteToFloat32 = (attr: THREE.BufferAttribute | THREE.InterleavedBufferAttribute): THREE.Float32BufferAttribute => {
+    const out = new Float32Array(attr.count * attr.itemSize);
+    const tmpV = new THREE.Vector3();
+    for (let i = 0; i < attr.count; i++) {
+      if (attr.itemSize === 3) {
+        tmpV.fromBufferAttribute(attr, i);
+        out[i * 3] = tmpV.x;
+        out[i * 3 + 1] = tmpV.y;
+        out[i * 3 + 2] = tmpV.z;
+      } else {
+        for (let k = 0; k < attr.itemSize; k++) {
+          out[i * attr.itemSize + k] = attr.getComponent(i, k);
+        }
+      }
+    }
+    return new THREE.Float32BufferAttribute(out, attr.itemSize);
+  };
+
+  const resetNodeToIdentity = (node: THREE.Object3D): void => {
+    node.position.set(0, 0, 0);
+    node.rotation.set(0, 0, 0);
+    node.quaternion.identity();
+    node.scale.set(1, 1, 1);
+    node.matrix.identity();
+    node.matrixWorld.identity();
+  };
+
+  const meshEntries: Array<{ mesh: THREE.Mesh; worldMatrix: THREE.Matrix4 }> = [];
+  const traversedNodes: THREE.Object3D[] = [];
+
+  const computeWorldMatricesRecursively = (
+    node: THREE.Object3D,
+    parentWorld: THREE.Matrix4 | null,
+  ): void => {
+    node.updateMatrix();
+    if (parentWorld) {
+      node.matrixWorld.multiplyMatrices(parentWorld, node.matrix);
+    } else {
+      node.matrixWorld.copy(node.matrix);
+    }
+    traversedNodes.push(node);
+
+    if (node instanceof THREE.Mesh && node.geometry) {
+      meshEntries.push({ mesh: node, worldMatrix: node.matrixWorld.clone() });
+    }
+    for (let i = 0; i < node.children.length; i++) {
+      computeWorldMatricesRecursively(node.children[i], node.matrixWorld);
+    }
+  };
+
+  computeWorldMatricesRecursively(rawScene, null);
+
+  // Reset all source hierarchy parent/child node transforms to identity after capturing worldMatrices
+  for (let i = 0; i < traversedNodes.length; i++) {
+    resetNodeToIdentity(traversedNodes[i]);
+  }
+
+  const meshes: THREE.Mesh[] = [];
+  for (let i = 0; i < meshEntries.length; i++) {
+    const { mesh: obj, worldMatrix } = meshEntries[i];
+    const bakedGeo = obj.geometry.clone();
+    // Promote quantized Int16/Int8 normalized glTF attributes to Float32 BEFORE baking world matrix
+    const rawPos = bakedGeo.attributes.position;
+    if (rawPos && !(rawPos.array instanceof Float32Array)) {
+      bakedGeo.setAttribute('position', promoteToFloat32(rawPos));
+    }
+    const rawNorm = bakedGeo.attributes.normal;
+    if (rawNorm && !(rawNorm.array instanceof Float32Array)) {
+      bakedGeo.setAttribute('normal', promoteToFloat32(rawNorm));
+    }
+    bakedGeo.applyMatrix4(worldMatrix);
+    if (!bakedGeo.attributes.normal) {
+      bakedGeo.computeVertexNormals();
+    }
+    bakedGeo.computeBoundingBox();
+
+    const bakedMesh = new THREE.Mesh(bakedGeo, obj.material);
+    bakedMesh.name = obj.name || 'koi-baked-mesh';
+    resetNodeToIdentity(bakedMesh);
+    meshes.push(bakedMesh);
+    bakedRoot.add(bakedMesh);
+  }
+
+  resetNodeToIdentity(bakedRoot);
+  if (meshes.length === 0) return bakedRoot;
+
+  bakedRoot.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(bakedRoot);
+  const size = new THREE.Vector3();
+  box.getSize(size);
+
+  // Align to upright XZ swim plane (Y shortest dorsal height, X lateral width, Z longest length)
+  const alreadyUprightXZ = size.z > size.x * 1.05 && size.y < size.x * 0.98 && size.y < size.z * 0.95;
+  if (!alreadyUprightXZ) {
+    // Compute 3x3 vertex covariance and align principal axes via Jacobi eigensolver
+    let mx = 0;
+    let my = 0;
+    let mz = 0;
+    let nPts = 0;
+    const pTmp = new THREE.Vector3();
+    for (const m of meshes) {
+      const pos = m.geometry.attributes.position as THREE.BufferAttribute | undefined;
+      if (!pos) continue;
+      for (let i = 0; i < pos.count; i++) {
+        pTmp.fromBufferAttribute(pos, i);
+        mx += pTmp.x;
+        my += pTmp.y;
+        mz += pTmp.z;
+        nPts++;
+      }
+    }
+    if (nPts > 3) {
+      mx /= nPts;
+      my /= nPts;
+      mz /= nPts;
+      const C = [
+        [0, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0],
+      ];
+      for (const m of meshes) {
+        const pos = m.geometry.attributes.position as THREE.BufferAttribute | undefined;
+        if (!pos) continue;
+        for (let i = 0; i < pos.count; i++) {
+          pTmp.fromBufferAttribute(pos, i);
+          const dx = pTmp.x - mx;
+          const dy = pTmp.y - my;
+          const dz = pTmp.z - mz;
+          C[0][0] += dx * dx;
+          C[0][1] += dx * dy;
+          C[0][2] += dx * dz;
+          C[1][1] += dy * dy;
+          C[1][2] += dy * dz;
+          C[2][2] += dz * dz;
+        }
+      }
+      C[1][0] = C[0][1];
+      C[2][0] = C[0][2];
+      C[2][1] = C[1][2];
+
+      const V = [
+        [1, 0, 0],
+        [0, 1, 0],
+        [0, 0, 1],
+      ];
+      for (let iter = 0; iter < 18; iter++) {
+        let p = 0;
+        let q = 1;
+        let maxOff = Math.abs(C[0][1]);
+        if (Math.abs(C[0][2]) > maxOff) {
+          p = 0;
+          q = 2;
+          maxOff = Math.abs(C[0][2]);
+        }
+        if (Math.abs(C[1][2]) > maxOff) {
+          p = 1;
+          q = 2;
+          maxOff = Math.abs(C[1][2]);
+        }
+        if (maxOff < 1e-12) break;
+
+        const tau = (C[q][q] - C[p][p]) / (2 * C[p][q]);
+        const t =
+          tau >= 0
+            ? 1 / (tau + Math.sqrt(1 + tau * tau))
+            : -1 / (-tau + Math.sqrt(1 + tau * tau));
+        const c = 1 / Math.sqrt(1 + t * t);
+        const s = t * c;
+
+        const cpp = C[p][p];
+        const cqq = C[q][q];
+        const cpq = C[p][q];
+        C[p][p] = c * c * cpp - 2 * s * c * cpq + s * s * cqq;
+        C[q][q] = s * s * cpp + 2 * s * c * cpq + c * c * cqq;
+        C[p][q] = 0;
+        C[q][p] = 0;
+        for (let r = 0; r < 3; r++) {
+          if (r === p || r === q) continue;
+          const crp = C[r][p];
+          const crq = C[r][q];
+          C[r][p] = c * crp - s * crq;
+          C[p][r] = C[r][p];
+          C[r][q] = s * crp + c * crq;
+          C[q][r] = C[r][q];
+        }
+        for (let r = 0; r < 3; r++) {
+          const vrp = V[r][p];
+          const vrq = V[r][q];
+          V[r][p] = c * vrp - s * vrq;
+          V[r][q] = s * vrp + c * vrq;
+        }
+      }
+
+      const eig = [0, 1, 2]
+        .map((idx) => ({
+          val: C[idx][idx],
+          vec: new THREE.Vector3(V[0][idx], V[1][idx], V[2][idx]).normalize(),
+        }))
+        .sort((a, b) => b.val - a.val);
+
+      const vMax = eig[0].vec; // -> +Z (snout-to-tail length)
+      const vMid = eig[1].vec; // -> +X (lateral width / C-curve plane)
+      const vMin = eig[2].vec; // -> +Y (dorsal-ventral height)
+      // Keep right-handed rotation (det = +1)
+      if (new THREE.Vector3().crossVectors(vMid, vMin).dot(vMax) < 0) {
+        vMid.negate();
+      }
+      const rotMat = new THREE.Matrix4().makeBasis(vMid, vMin, vMax).transpose();
+      for (const m of meshes) m.geometry.applyMatrix4(rotMat);
+    }
+  }
+
+  // Verify dorsal ridge protrudes toward +Y rather than being flipped upside-down (-Y)
+  bakedRoot.updateMatrixWorld(true);
+  box.setFromObject(bakedRoot);
+  box.getSize(size);
+  const midY = (box.min.y + box.max.y) * 0.5;
+  let sumY = 0;
+  let vCount = 0;
+  const vTmp = new THREE.Vector3();
+  for (const m of meshes) {
+    const pos = m.geometry.attributes.position as THREE.BufferAttribute | undefined;
+    if (!pos) continue;
+    for (let i = 0; i < pos.count; i++) {
+      vTmp.fromBufferAttribute(pos, i);
+      sumY += vTmp.y;
+      vCount++;
+    }
+  }
+  if (vCount > 0 && size.y > 1e-6) {
+    const meanY = sumY / vCount;
+    if (meanY - midY > size.y * 0.05) {
+      for (const m of meshes) m.geometry.rotateZ(Math.PI);
+    }
+  }
+
+  for (const m of meshes) {
+    m.geometry.computeBoundingBox();
+    m.geometry.computeBoundingSphere();
+  }
+  return bakedRoot;
+}
+
+/**
+ * Un-bends a baked C-curved koi BufferGeometry onto a straight +Z spine using dorsal-filtered
+ * circular-arc polar coordinates refined by one continuous quadratic centerline r(u) in XZ
+ * (zero piecewise seams, pectoral fin outliers excluded, exact C∞ normal transform).
+ */
+export function straightenKoiGeometry(geometry: THREE.BufferGeometry): void {
   const posAttr = geometry.attributes.position as THREE.BufferAttribute | undefined;
   if (!posAttr || posAttr.count < 16) return;
   const normAttr = geometry.attributes.normal as THREE.BufferAttribute | undefined;
@@ -192,20 +663,20 @@ function straightenKoiGeometry(geometry: THREE.BufferGeometry): void {
 
   const tmp = new THREE.Vector3();
   const tmpN = new THREE.Vector3();
+  let minY = Infinity;
+  let maxY = -Infinity;
   let minZ = Infinity;
   let maxZ = -Infinity;
-  let minX = Infinity;
-  let maxX = -Infinity;
 
   for (let i = 0; i < count; i++) {
     tmp.fromBufferAttribute(posAttr, i);
     px[i] = tmp.x;
     py[i] = tmp.y;
     pz[i] = tmp.z;
+    if (tmp.y < minY) minY = tmp.y;
+    if (tmp.y > maxY) maxY = tmp.y;
     if (tmp.z < minZ) minZ = tmp.z;
     if (tmp.z > maxZ) maxZ = tmp.z;
-    if (tmp.x < minX) minX = tmp.x;
-    if (tmp.x > maxX) maxX = tmp.x;
     if (normAttr && nxArr && nyArr && nzArr) {
       tmpN.fromBufferAttribute(normAttr, i);
       nxArr[i] = tmpN.x;
@@ -215,200 +686,171 @@ function straightenKoiGeometry(geometry: THREE.BufferGeometry): void {
   }
 
   const spanZ = maxZ - minZ;
-  if (spanZ < 1e-4) return;
-  const midZ = (minZ + maxZ) * 0.5;
-  const halfSpanZ = spanZ * 0.5;
+  const spanY = maxY - minY;
+  if (spanZ < 1e-6) return;
 
-  // Verify which end of Z is thicker (head/shoulder ~25% from snout vs narrow caudal peduncle ~78%)
-  const checkThickness = (fromPosZ: boolean): number => {
-    let headSum = 0;
-    let headN = 0;
-    let tailSum = 0;
-    let tailN = 0;
-    for (let i = 0; i < count; i++) {
-      const t = fromPosZ ? (maxZ - pz[i]) / spanZ : (pz[i] - minZ) / spanZ;
-      const rSq = px[i] * px[i] + py[i] * py[i];
-      if (t >= 0.18 && t <= 0.32) {
-        headSum += rSq;
-        headN++;
-      } else if (t >= 0.72 && t <= 0.84) {
-        tailSum += rSq;
-        tailN++;
-      }
-    }
-    return (headN > 0 ? headSum / headN : 0) / Math.max(1e-8, tailN > 0 ? tailSum / tailN : 1e-6);
-  };
-  const snoutAtPosZ = checkThickness(true) >= checkThickness(false);
+  // Filter out low ventral pectoral fins (lower 42% of height) so spine fit tracks dorsal torso cleanly
+  const yCut = minY + spanY * 0.42;
+  const torsoIndices: number[] = [];
+  for (let i = 0; i < count; i++) {
+    if (py[i] >= yCut) torsoIndices.push(i);
+  }
+  const activeIndices = torsoIndices.length >= 48 ? torsoIndices : Array.from({ length: count }, (_, i) => i);
 
-  // Bin vertices into 18 cross-sections along Z and find core kernel-density X mode to ignore lateral pectoral fins
-  const numBins = 18;
-  const bw = spanZ * 0.0425;
-  const bwSq2 = 2 * bw * bw;
-  const sliceSamples: Array<{ zn: number; x: number; w: number }> = [];
-
+  const numBins = 26;
+  const sliceSamples: Array<{ x: number; z: number; w: number }> = [];
   for (let b = 0; b < numBins; b++) {
     const zLo = minZ + (b / numBins) * spanZ;
     const zHi = minZ + ((b + 1) / numBins) * spanZ;
-    const binIndices: number[] = [];
+    const binX: number[] = [];
+    const binZ: number[] = [];
+    for (let k = 0; k < activeIndices.length; k++) {
+      const idx = activeIndices[k];
+      if (pz[idx] >= zLo && pz[idx] <= zHi) {
+        binX.push(px[idx]);
+        binZ.push(pz[idx]);
+      }
+    }
+    if (binX.length < 6) continue;
+    binX.sort((a, b) => a - b);
+    binZ.sort((a, b) => a - b);
+    sliceSamples.push({
+      x: binX[binX.length >> 1],
+      z: binZ[binZ.length >> 1],
+      w: Math.sqrt(binX.length),
+    });
+  }
+
+  const circle = fitCircleIRLS(sliceSamples);
+  const circleValid =
+    circle !== null &&
+    circle.R <= spanZ * 4.5 &&
+    !px.some((xVal, i) => Math.hypot(xVal - circle.cx, pz[i] - circle.cz) < circle.R * 0.15);
+
+  if (!circleValid) {
+    // Low-curvature fallback: singular quadratic centerline xCenter(u) in XZ space
+    const zMid = (minZ + maxZ) * 0.5;
+    const invHalfZ = 2 / spanZ;
+    const zSamples = sliceSamples.map((s) => ({
+      u: (s.z - zMid) * invHalfZ,
+      r: s.x,
+      w: s.w,
+    }));
+    const qx = fitQuadraticIRLS(zSamples, 0, spanZ * 0.025);
+    const newPos = new Float32Array(count * 3);
+    const newNorm = normAttr ? new Float32Array(count * 3) : null;
+
     for (let i = 0; i < count; i++) {
-      if (pz[i] >= zLo && pz[i] <= zHi) binIndices.push(i);
-    }
-    if (binIndices.length < 12) continue;
+      const u = (pz[i] - zMid) * invHalfZ;
+      const xSpine = qx.c0 + qx.c1 * u + qx.c2 * u * u;
+      const dxDu = (qx.c1 + 2 * qx.c2 * u) * invHalfZ;
+      const tangentLen = Math.hypot(dxDu, 1);
 
-    // Evaluate Gaussian kernel density along candidate X positions inside the slice
-    let bestX = 0;
-    let bestScore = -1;
-    const step = Math.max(1, Math.floor(binIndices.length / 40));
-    for (let ci = 0; ci < binIndices.length; ci += step) {
-      const candX = px[binIndices[ci]];
-      let score = 0;
-      for (let si = 0; si < binIndices.length; si += step) {
-        const dx = px[binIndices[si]] - candX;
-        score += Math.exp(-(dx * dx) / bwSq2);
-      }
-      if (score > bestScore) {
-        bestScore = score;
-        bestX = candX;
+      newPos[i * 3] = (px[i] - xSpine) / tangentLen;
+      newPos[i * 3 + 1] = py[i];
+      newPos[i * 3 + 2] = pz[i] - zMid;
+
+      if (newNorm && nxArr && nyArr && nzArr) {
+        const rx = nxArr[i] - dxDu * nzArr[i];
+        const ry = nyArr[i];
+        const rz = dxDu * nxArr[i] + nzArr[i];
+        const rLen = Math.hypot(rx, ry, rz) || 1;
+        newNorm[i * 3] = rx / rLen;
+        newNorm[i * 3 + 1] = ry / rLen;
+        newNorm[i * 3 + 2] = rz / rLen;
       }
     }
 
-    // Weighted core centroid within ~1.4*bw of the density peak
-    let sumX = 0;
-    let sumZ = 0;
-    let sumW = 0;
-    for (let k = 0; k < binIndices.length; k++) {
-      const idx = binIndices[k];
-      const dx = px[idx] - bestX;
-      const w = Math.exp(-(dx * dx) / bwSq2);
-      if (w > 0.15) {
-        sumX += px[idx] * w;
-        sumZ += pz[idx] * w;
-        sumW += w;
-      }
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(newPos, 3));
+    if (newNorm) {
+      geometry.setAttribute('normal', new THREE.Float32BufferAttribute(newNorm, 3));
+    } else {
+      geometry.computeVertexNormals();
     }
-    if (sumW > 1) {
-      sliceSamples.push({
-        zn: (sumZ / sumW - midZ) / halfSpanZ,
-        x: sumX / sumW,
-        w: Math.sqrt(sumW),
-      });
-    }
+    geometry.computeBoundingBox();
+    geometry.computeBoundingSphere();
+    return;
   }
 
-  const coef = fitCubicIRLS(sliceSamples);
-  if (!coef) return;
+  const { cx, cz, R } = circle!;
 
-  // Verify the curve actually has curvature worth straightening (avoid distorting already-straight models)
-  const curveSpanX = Math.abs(
-    coef[0] + coef[2] - (coef[0] - coef[1] + coef[2] - coef[3]) * 0.5 - (coef[0] + coef[1] + coef[2] + coef[3]) * 0.5,
+  let sinSum = 0;
+  let cosSum = 0;
+  for (let i = 0; i < sliceSamples.length; i++) {
+    const th = Math.atan2(sliceSamples[i].z - cz, sliceSamples[i].x - cx);
+    sinSum += Math.sin(th) * sliceSamples[i].w;
+    cosSum += Math.cos(th) * sliceSamples[i].w;
+  }
+  const thetaMid = Math.atan2(sinSum, cosSum);
+  const thFirst = Math.atan2(sliceSamples[0].z - cz, sliceSamples[0].x - cx);
+  const thLast = Math.atan2(
+    sliceSamples[sliceSamples.length - 1].z - cz,
+    sliceSamples[sliceSamples.length - 1].x - cx,
   );
-  if (curveSpanX < spanZ * 0.03 && Math.abs(coef[2]) < spanZ * 0.03) return;
+  // Preserves orientation + right-handed triangle winding
+  const sign = wrapAngleRad(thLast - thFirst) >= 0 ? 1 : -1;
 
-  // Sample 80 ordered centerline points C(u) from u=0 (snout) -> u=1 (tail)
-  const N = 80;
-  const cx = new Float64Array(N);
-  const cz = new Float64Array(N);
-  const arcS = new Float64Array(N);
+  // Polar-bin dorsal torso by angle u = wrapAngleRad(theta - thetaMid) and fit smooth single quadratic rSpine(u)
+  const uList: Array<{ u: number; r: number }> = [];
+  let minU = Infinity;
+  let maxU = -Infinity;
+  for (let k = 0; k < activeIndices.length; k++) {
+    const idx = activeIndices[k];
+    const dx = px[idx] - cx;
+    const dz = pz[idx] - cz;
+    const r = Math.hypot(dx, dz);
+    const u = wrapAngleRad(Math.atan2(dz, dx) - thetaMid);
+    if (u < minU) minU = u;
+    if (u > maxU) maxU = u;
+    uList.push({ u, r });
+  }
 
-  for (let k = 0; k < N; k++) {
-    const u = k / (N - 1);
-    const zVal = snoutAtPosZ ? maxZ - u * spanZ : minZ + u * spanZ;
-    const zn = (zVal - midZ) / halfSpanZ;
-    cx[k] = coef[0] + coef[1] * zn + coef[2] * zn * zn + coef[3] * zn * zn * zn;
-    cz[k] = zVal;
-    if (k > 0) {
-      arcS[k] = arcS[k - 1] + Math.hypot(cx[k] - cx[k - 1], cz[k] - cz[k - 1]);
+  const uSamples: Array<{ u: number; r: number; w: number }> = [];
+  const uBins = 22;
+  const uSpan = Math.max(1e-4, maxU - minU);
+  for (let b = 0; b < uBins; b++) {
+    const uLo = minU + (b / uBins) * uSpan;
+    const uHi = minU + ((b + 1) / uBins) * uSpan;
+    const rs: number[] = [];
+    for (let k = 0; k < uList.length; k++) {
+      if (uList[k].u >= uLo && uList[k].u <= uHi) rs.push(uList[k].r);
     }
+    if (rs.length < 8) continue;
+    rs.sort((a, b) => a - b);
+    uSamples.push({ u: (uLo + uHi) * 0.5, r: rs[rs.length >> 1], w: Math.sqrt(rs.length) });
   }
 
-  const totalArc = arcS[N - 1];
-  if (totalArc < 1e-4) return;
-  const halfArc = totalArc * 0.5;
-
-  // Precompute smooth unit tangents T pointing tail -> snout (+Z after straightening) at every sample
-  const tx = new Float64Array(N);
-  const tz = new Float64Array(N);
-  for (let k = 0; k < N; k++) {
-    const kPrev = Math.max(0, k - 1);
-    const kNext = Math.min(N - 1, k + 1);
-    // C goes snout(0)->tail(N-1), so kPrev - kNext points tail->snout
-    const dx = cx[kPrev] - cx[kNext];
-    const dz = cz[kPrev] - cz[kNext];
-    const len = Math.hypot(dx, dz) || 1;
-    tx[k] = dx / len;
-    tz[k] = dz / len;
-  }
-
+  const quad = fitQuadraticIRLS(uSamples, R);
   const newPos = new Float32Array(count * 3);
   const newNorm = normAttr ? new Float32Array(count * 3) : null;
 
   for (let i = 0; i < count; i++) {
-    const vx = px[i];
-    const vy = py[i];
-    const vz = pz[i];
+    const dx = px[i] - cx;
+    const dz = pz[i] - cz;
+    const r = Math.hypot(dx, dz) || 1e-6;
+    const theta = Math.atan2(dz, dx);
+    const dTh = wrapAngleRad(theta - thetaMid);
+    const rSpine = quad.c0 + quad.c1 * dTh + quad.c2 * dTh * dTh;
 
-    // Exact nearest point projection across all 79 centerline segments [k, k+1]
-    let bestDistSq = Infinity;
-    let bestK = 0;
-    let bestSegT = 0;
-    let bestNearX = cx[0];
-    let bestNearZ = cz[0];
-
-    for (let k = 0; k < N - 1; k++) {
-      const ax = cx[k];
-      const az = cz[k];
-      const abx = cx[k + 1] - ax;
-      const abz = cz[k + 1] - az;
-      const abLenSq = abx * abx + abz * abz;
-      const segT = abLenSq > 1e-12
-        ? Math.max(0, Math.min(1, ((vx - ax) * abx + (vz - az) * abz) / abLenSq))
-        : 0;
-      const nearX = ax + abx * segT;
-      const nearZ = az + abz * segT;
-      const dx = vx - nearX;
-      const dz = vz - nearZ;
-      const dSq = dx * dx + dz * dz;
-      if (dSq < bestDistSq) {
-        bestDistSq = dSq;
-        bestK = k;
-        bestSegT = segT;
-        bestNearX = nearX;
-        bestNearZ = nearZ;
-      }
-    }
-
-    const sStar = arcS[bestK] + (arcS[bestK + 1] - arcS[bestK]) * bestSegT;
-    // Smoothly interpolated tangent T pointing tail -> snout (+Z)
-    let tanX = tx[bestK] + (tx[bestK + 1] - tx[bestK]) * bestSegT;
-    let tanZ = tz[bestK] + (tz[bestK + 1] - tz[bestK]) * bestSegT;
-    const tanLen = Math.hypot(tanX, tanZ) || 1;
-    tanX /= tanLen;
-    tanZ /= tanLen;
-
-    // Right-handed lateral normal N = (T.z, -T.x) so N x Y = T (det = +1, preserves winding)
-    const latNormX = tanZ;
-    const latNormZ = -tanX;
-
-    const relX = vx - bestNearX;
-    const relZ = vz - bestNearZ;
-    const lat = relX * latNormX + relZ * latNormZ;
-    // Preserve signed extension past snout (k=0, segT=0) or past tail (k=N-2, segT=1)
-    const along =
-      (bestK === 0 && bestSegT <= 1e-6) || (bestK === N - 2 && bestSegT >= 1 - 1e-6)
-        ? relX * tanX + relZ * tanZ
-        : 0;
-
-    newPos[i * 3] = lat;
-    newPos[i * 3 + 1] = vy;
-    newPos[i * 3 + 2] = halfArc - sStar + along;
+    newPos[i * 3] = sign * (r - rSpine);
+    newPos[i * 3 + 1] = py[i];
+    newPos[i * 3 + 2] = sign * R * dTh;
 
     if (newNorm && nxArr && nyArr && nzArr) {
+      const cosT = dx / r;
+      const sinT = dz / r;
       const nX = nxArr[i];
       const nY = nyArr[i];
       const nZ = nzArr[i];
-      const rX = nX * latNormX + nZ * latNormZ;
+
+      const nRadial = nX * cosT + nZ * sinT;
+      const nTheta = -nX * sinT + nZ * cosT;
+      const drDu = quad.c1 + 2 * quad.c2 * dTh;
+
+      // Exact C-infinity inverse-transpose normal mapping under polar-quadratic unwrap
+      const rX = sign * nRadial;
       const rY = nY;
-      const rZ = nX * tanX + nZ * tanZ;
+      const rZ = sign * ((drDu / R) * nRadial + (r / R) * nTheta);
       const rLen = Math.hypot(rX, rY, rZ) || 1;
       newNorm[i * 3] = rX / rLen;
       newNorm[i * 3 + 1] = rY / rLen;
@@ -427,10 +869,10 @@ function straightenKoiGeometry(geometry: THREE.BufferGeometry): void {
 }
 
 /**
- * Measures raw model bounding box, aligns spine along Z, inspects 25% vs 78% cross-section thickness
- * so snout strictly points +Z, preserves dorsal +Y, centers origin, and normalizes unit length = 1.0.
+ * Measures baked model bounding box, verifies dorsal-up +Z orientation (snout +Z, tail -Z),
+ * centers origin, and normalizes unit length = 1.0.
  */
-function buildNormalizedKoiPrototype(rawScene: THREE.Object3D): THREE.Group {
+export function buildNormalizedKoiPrototype(rawScene: THREE.Object3D): THREE.Group {
   rawScene.updateMatrixWorld(true);
   const rawBox = new THREE.Box3().setFromObject(rawScene);
   const rawSize = new THREE.Vector3();
@@ -535,6 +977,10 @@ function attachKoiVarietyAndSwimShader(
   timeUniform: { value: number },
   freqUniform: { value: number },
   bendUniform: { value: number },
+  causticTimeUniform: { value: number },
+  waveTexUniform: { value: THREE.Texture | null },
+  waveTexelUniform: { value: THREE.Vector2 },
+  pondBoundsUniform: { value: THREE.Vector4 },
   phase: number,
   useVertexSwim: boolean,
 ) {
@@ -544,6 +990,10 @@ function attachKoiVarietyAndSwimShader(
     shader.uniforms.uSwimTime = timeUniform;
     shader.uniforms.uSwimFreq = freqUniform;
     shader.uniforms.uTurnBend = bendUniform;
+    shader.uniforms.uCausticTime = causticTimeUniform;
+    shader.uniforms.tWave = waveTexUniform;
+    shader.uniforms.uWaveTexel = waveTexelUniform;
+    shader.uniforms.uPondBounds = pondBoundsUniform;
     shader.uniforms.uPhase = { value: phase };
     shader.uniforms.uWaterY = { value: waterY };
     shader.uniforms.uVariety = { value: variety };
@@ -573,8 +1023,9 @@ function attachKoiVarietyAndSwimShader(
           // Normalized spine coordinate s: snout (+0.5 Z) -> 0.0, caudal tail (-0.5 Z) -> 1.0
           float spineS = clamp(0.5 - kProtoPos.z, 0.0, 1.0);
           float sCurve = pow(spineS, 1.65);
-          float phaseArg = uSwimTime * uSwimFreq + uPhase - spineS * 4.85;
-          float lateralWave = sin(phaseArg) * (0.01 + 0.095 * sCurve);
+          float phaseArg = uSwimTime * uSwimFreq + uPhase - spineS * 4.4;
+          // Calm ~0.04 body-length tail undulation + smooth yaw-driven turn arc
+          float lateralWave = sin(phaseArg) * (0.004 + 0.036 * sCurve);
           float turnArc = uTurnBend * pow(spineS, 1.5);
           kProtoPos.x += lateralWave + turnArc;
           transformed = (uProtoToMesh * vec4(kProtoPos, 1.0)).xyz;
@@ -593,7 +1044,10 @@ function attachKoiVarietyAndSwimShader(
         `#include <common>
         uniform float uWaterY;
         uniform float uVariety;
-        uniform float uSwimTime;
+        uniform float uCausticTime;
+        uniform sampler2D tWave;
+        uniform vec2 uWaveTexel;
+        uniform vec4 uPondBounds;
         varying vec3 vKoiWorldPos;
         varying vec3 vKoiWorldNormal;
         varying vec3 vKoiLocalPos;
@@ -625,46 +1079,7 @@ function attachKoiVarietyAndSwimShader(
           return koiNoise3(p) * 0.62 + koiNoise3(p * 2.1 + 3.7) * 0.38;
         }
 
-        vec2 koiCausticHash2(vec2 p) {
-          p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
-          return fract(sin(p) * 43758.5453123);
-        }
-
-        float koiVoronoiEdge(vec2 x, float t) {
-          vec2 n = floor(x);
-          vec2 f = fract(x);
-          float d1 = 8.0;
-          float d2 = 8.0;
-          for (int j = -1; j <= 1; j++) {
-            for (int i = -1; i <= 1; i++) {
-              vec2 g = vec2(float(i), float(j));
-              vec2 o = koiCausticHash2(n + g);
-              o = 0.5 + 0.44 * sin(t + 6.2831 * o);
-              vec2 r = g - f + o;
-              float d = dot(r, r);
-              if (d < d1) {
-                d2 = d1;
-                d1 = d;
-              } else if (d < d2) {
-                d2 = d;
-              }
-            }
-          }
-          return pow(clamp(1.0 - abs(sqrt(d2) - sqrt(d1)) * 4.4, 0.0, 1.0), 3.6);
-        }
-
-        float koiCausticArcs(vec2 p, float t) {
-          vec2 warp = vec2(
-            sin(p.y * 1.6 + t * 0.42) + cos(p.x * 1.1 - t * 0.35) * 0.5,
-            cos(p.x * 1.5 - t * 0.38) + sin(p.y * 1.2 + t * 0.31) * 0.5
-          ) * 0.24;
-          float f1 = koiVoronoiEdge((p + warp) * 1.55, t * 0.72);
-          float f2 = koiVoronoiEdge((mat2(0.8, -0.6, 0.6, 0.8) * (p - warp * 0.8)) * 1.95 + vec2(3.7, -2.1), -t * 0.58 + 1.9);
-          float break1 = smoothstep(0.08, 0.68, sin(p.x * 1.85 - p.y * 1.35 + t * 0.28 + sin(p.y * 2.1) * 0.7));
-          float break2 = smoothstep(0.08, 0.68, cos(p.x * 1.55 + p.y * 1.75 - t * 0.24 + cos(p.x * 1.9) * 0.7));
-          float sunPocket = smoothstep(-0.12, 0.52, sin(p.x * 0.85 + t * 0.14) * cos(p.y * 0.95 - t * 0.12));
-          return clamp(f1 * break1 + f2 * break2 * 0.78, 0.0, 1.0) * (0.30 + 0.70 * sunPocket);
-        }`,
+        ${POND_CAUSTICS_GLSL}`,
       )
       .replace(
         '#include <map_fragment>',
@@ -705,13 +1120,20 @@ function attachKoiVarietyAndSwimShader(
           recolored = mix(pearlWhite, spotCol, spotMask);
           recolored = mix(recolored, showaSumi, flankSumi * (1.0 - spotMask * 0.65));
         } else if (uVariety < 4.5) {
-          // 4: Yamabuki Ogon (warm metallic gold body wash with burnished amber-gold spot shading)
-          vec3 goldWash = vec3(0.98, 0.76, 0.18) * (0.68 + 0.42 * scaleTone);
-          vec3 amberShade = vec3(0.86, 0.50, 0.09) * (0.68 + 0.40 * scaleTone);
-          recolored = mix(goldWash, amberShade, spotMask * 0.46);
+          // 4: Ki Utsuri (warm golden-amber body with bold velvety sumi ink-black patches)
+          float extraSumi = smoothstep(0.54, 0.65, koiFbm(vKoiLocalPos * vec3(3.8, 3.4, 3.2) + vec3(3.1, 0.8, 1.9)))
+                          * smoothstep(-0.38, 0.38, vKoiLocalPos.z);
+          float kiSumiMask = max(spotMask, extraSumi * 0.94);
+          vec3 kiGold = vec3(0.95, 0.70, 0.14) * (0.68 + 0.40 * scaleTone);
+          vec3 kiSumi = vec3(0.055, 0.060, 0.070) * (0.65 + 0.35 * scaleTone);
+          recolored = mix(kiGold, kiSumi, kiSumiMask);
         } else {
-          // 5: Platinum Ogon (desaturated luminous silver-pearl white)
-          recolored = vec3(0.95, 0.96, 0.98) * (0.76 + 0.28 * scaleTone);
+          // 5: Yamabuki Hariwake (luminous pearl white with vivid saffron-gold patches)
+          float extraGold = smoothstep(0.55, 0.66, koiFbm(vKoiLocalPos * vec3(3.6, 3.4, 3.2) + vec3(1.4, 2.3, 4.1)))
+                          * smoothstep(-0.38, 0.38, vKoiLocalPos.z);
+          float goldPatchMask = max(spotMask, extraGold * 0.92);
+          vec3 hariwakeGold = vec3(0.98, 0.68, 0.07) * (0.70 + 0.38 * scaleTone);
+          recolored = mix(pearlWhite, hariwakeGold, goldPatchMask);
         }
 
         diffuseColor.rgb = mix(diffuseColor.rgb, recolored, protectDark);`,
@@ -720,24 +1142,305 @@ function attachKoiVarietyAndSwimShader(
         '#include <lights_fragment_end>',
         `#include <lights_fragment_end>
         float koiDepth = max(0.0, uWaterY - vKoiWorldPos.y);
-        vec3 koiBeer = exp(-koiDepth * vec3(0.88, 0.48, 0.42));
-        reflectedLight.directDiffuse *= koiBeer;
-        reflectedLight.indirectDiffuse *= mix(vec3(1.0), koiBeer, 0.82);
+        // Gentle aquatic color absorption + clean exposure lift so submerged koi stay vivid beneath water refraction
+        vec3 koiBeer = exp(-koiDepth * vec3(0.32, 0.17, 0.15));
+        reflectedLight.directDiffuse *= koiBeer * 1.42;
+        reflectedLight.indirectDiffuse *= mix(vec3(1.0), koiBeer, 0.72) * 1.28;
 
-        float koiArcs = koiCausticArcs(vKoiWorldPos.xz, uSwimTime * 0.82);
-        float koiDorsal = smoothstep(0.0, 0.65, vKoiWorldNormal.y);
-        reflectedLight.directDiffuse += vec3(0.88, 0.95, 0.89) * (koiArcs * 0.145 * koiDorsal);`,
+        // Wet aquatic Fresnel sheen & subtle sunlit subsurface scatter along flanks and fin edges
+        vec3 koiN = normalize(vKoiWorldNormal);
+        vec3 koiV = normalize(cameraPosition - vKoiWorldPos);
+        float koiFresnel = pow(1.0 - max(dot(koiN, koiV), 0.0), 2.5);
+        float koiDorsal = smoothstep(-0.08, 0.65, koiN.y);
+        float koiFlankMask = smoothstep(-0.25, 0.35, koiN.y);
+        reflectedLight.indirectSpecular += vec3(0.24, 0.31, 0.30) * koiFresnel * (0.45 + 0.55 * koiDorsal);
+        reflectedLight.directDiffuse += diffuseColor.rgb * vec3(0.36, 0.28, 0.20) * koiFresnel * koiFlankMask * 0.42;
+
+        float koiWaveCaustic = pondWaveLaplacianCaustic(
+          tWave,
+          uWaveTexel,
+          uPondBounds,
+          vKoiWorldPos,
+          uWaterY
+        );
+        float koiThreads = pondAmbientSunThreads(vKoiWorldPos.xz, uCausticTime);
+        float koiCover = pondCausticCoverMask(vKoiWorldPos.xz, 1.0);
+        reflectedLight.directDiffuse += vec3(1.0, 0.95, 0.80) * (koiWaveCaustic * 0.44 + koiThreads * 0.20) * koiCover * koiDorsal;`,
       );
   };
   mat.customProgramCacheKey = () =>
-    `koi-glb-variety-${variety}-swim-${useVertexSwim ? '1' : '0'}-voronoi-v2`;
+    `koi-glb-swim-${useVertexSwim ? '1' : '0'}-laplacian-v7`;
+}
+
+export function stepKoiSchoolMotion(
+  agents: KoiMotionState[],
+  dt: number,
+  elapsedSec: number,
+  impulses: ReadonlyArray<{ x: number; z: number; startTime: number }>,
+  checkBookOverhang: boolean,
+): void {
+  const marginX = 2.05;
+  const marginZ = 1.48;
+
+  for (let i = 0; i < agents.length; i++) {
+    const koi = agents[i];
+
+    // 1. Track displacement progress to detect stalling / getting pinned in one spot
+    if (Math.hypot(koi.x - koi.anchorX, koi.z - koi.anchorZ) >= 0.10) {
+      koi.anchorX = koi.x;
+      koi.anchorZ = koi.z;
+      koi.stuckTimer = 0;
+    } else {
+      koi.stuckTimer += dt;
+    }
+
+    koi.wanderPhase += dt * (0.45 + koi.spec.variety * 0.06);
+    koi.burst = Math.max(0, koi.burst - dt * 0.65);
+
+    const headX = Math.sin(koi.yaw);
+    const headZ = Math.cos(koi.yaw);
+    const probeX = koi.x + headX * 0.28;
+    const probeZ = koi.z + headZ * 0.28;
+
+    const sepBody = nearestObstacleSeparation(koi.x, koi.z, 0.26, checkBookOverhang, true);
+    const sepProbe = nearestObstacleSeparation(probeX, probeZ, 0.24, checkBookOverhang, true);
+    const headDotObs = headX * sepBody.nx + headZ * sepBody.nz;
+
+    const hitWall =
+      (koi.x > marginX + 0.08 && headX > 0.1) ||
+      (koi.x < -(marginX + 0.08) && headX < -0.1) ||
+      (koi.z > marginZ + 0.08 && headZ > 0.1) ||
+      (koi.z < -(marginZ + 0.08) && headZ < -0.1);
+
+    const hittingObstacle =
+      sepBody.dist < -0.005 ||
+      (sepBody.dist < 0.08 && headDotObs < 0.22) ||
+      sepProbe.dist < -0.04;
+
+    const isStuck = koi.stuckTimer >= 1.35;
+
+    if (hittingObstacle || hitWall || isStuck) {
+      const shouldRefreshEvade =
+        koi.evadeTimer <= 0.05 || sepBody.dist < -0.015 || isStuck;
+
+      if (shouldRefreshEvade) {
+        let awayX = 0;
+        let awayZ = 0;
+
+        if (hitWall) {
+          if (Math.abs(koi.x) > marginX) awayX += -Math.sign(koi.x);
+          if (Math.abs(koi.z) > marginZ) awayZ += -Math.sign(koi.z);
+        } else {
+          const refSep = sepBody.dist <= sepProbe.dist ? sepBody : sepProbe;
+          awayX += refSep.nx;
+          awayZ += refSep.nz;
+        }
+
+        // Tangential arc bias so head-on hits always pick a decisive smooth turn side
+        const turnSign = koi.spec.variety % 2 === 0 ? 1 : -1;
+        const tanX = -awayZ * turnSign;
+        const tanZ = awayX * turnSign;
+        awayX += tanX * 0.35;
+        awayZ += tanZ * 0.35;
+
+        // Bias gently back toward open North or South lagoon center
+        const lagoonTargetZ = koi.z >= 0 ? 0.98 : -1.14;
+        const toLagoonX = 0 - koi.x;
+        const toLagoonZ = lagoonTargetZ - koi.z;
+        const toLagoonLen = Math.hypot(toLagoonX, toLagoonZ) || 1;
+        awayX += (toLagoonX / toLagoonLen) * 0.45;
+        awayZ += (toLagoonZ / toLagoonLen) * 0.45;
+
+        const awayLen = Math.hypot(awayX, awayZ) || 1;
+        awayX /= awayLen;
+        awayZ /= awayLen;
+
+        koi.evadeYaw = Math.atan2(awayX, awayZ);
+        koi.evadeTimer = isStuck ? 2.0 : 1.45;
+        koi.burst = Math.max(koi.burst, 0.32);
+
+        // Skip any waypoint that points back into the blocked region
+        let bestWpIdx = (koi.waypointIndex + 1) % koi.spec.waypoints.length;
+        let bestScore = -Infinity;
+        for (let wIdx = 0; wIdx < koi.spec.waypoints.length; wIdx++) {
+          const candidate = koi.spec.waypoints[wIdx];
+          const midX = (koi.x + candidate.x) * 0.5;
+          const midZ = (koi.z + candidate.z) * 0.5;
+          const midClear = nearestObstacleSeparation(
+            midX,
+            midZ,
+            0.22,
+            checkBookOverhang,
+            true,
+          ).dist;
+          const dx = candidate.x - koi.x;
+          const dz = candidate.z - koi.z;
+          const dLen = Math.hypot(dx, dz) || 1;
+          const align = (dx / dLen) * awayX + (dz / dLen) * awayZ;
+          const score = align + (midClear > 0 ? 0.6 : -1.5);
+          if (score > bestScore) {
+            bestScore = score;
+            bestWpIdx = wIdx;
+          }
+        }
+        koi.waypointIndex = bestWpIdx;
+        koi.stuckTimer = 0;
+        koi.anchorX = koi.x;
+        koi.anchorZ = koi.z;
+      }
+    }
+
+    let desiredYaw: number;
+    let maxTurnRate: number;
+
+    if (koi.evadeTimer > 0) {
+      koi.evadeTimer = Math.max(0, koi.evadeTimer - dt);
+      desiredYaw = koi.evadeYaw;
+      maxTurnRate = 1.85;
+    } else {
+      const wp = koi.spec.waypoints[koi.waypointIndex];
+      const toWpX = wp.x - koi.x;
+      const toWpZ = wp.z - koi.z;
+      if (Math.hypot(toWpX, toWpZ) < 0.24) {
+        koi.waypointIndex = (koi.waypointIndex + 1) % koi.spec.waypoints.length;
+      }
+
+      const wpLen = Math.hypot(toWpX, toWpZ) || 1;
+      let steerX = toWpX / wpLen;
+      let steerZ = toWpZ / wpLen;
+
+      // Gentle natural wander
+      const perpX = -steerZ;
+      const perpZ = steerX;
+      const wanderAmt = Math.sin(koi.wanderPhase) * 0.14;
+      steerX += perpX * wanderAmt;
+      steerZ += perpZ * wanderAmt;
+
+      // Soft pond border repulsion
+      if (Math.abs(koi.x) > marginX - 0.15) {
+        steerX += -Math.sign(koi.x) * ((Math.abs(koi.x) - (marginX - 0.15)) * 1.6);
+      }
+      if (Math.abs(koi.z) > marginZ - 0.12) {
+        steerZ += -Math.sign(koi.z) * ((Math.abs(koi.z) - (marginZ - 0.12)) * 1.6);
+      }
+
+      // Smooth predictive obstacle avoidance
+      if (sepBody.dist < 0.24) {
+        const push = (0.24 - sepBody.dist) * 3.2;
+        steerX += sepBody.nx * push;
+        steerZ += sepBody.nz * push;
+      }
+      if (sepProbe.dist < 0.22) {
+        const push = (0.22 - sepProbe.dist) * 2.4;
+        steerX += sepProbe.nx * push;
+        steerZ += sepProbe.nz * push;
+      }
+
+      // Same-depth-layer fish separation
+      for (let j = 0; j < agents.length; j++) {
+        if (i === j) continue;
+        const other = agents[j];
+        if (Math.abs(other.spec.depthOffset - koi.spec.depthOffset) > 0.045) continue;
+        const dx = koi.x - other.x;
+        const dz = koi.z - other.z;
+        const dist = Math.hypot(dx, dz);
+        if (dist > 0.001 && dist < 0.44) {
+          const push = ((0.44 - dist) / 0.44) * 1.85;
+          steerX += (dx / dist) * push;
+          steerZ += (dz / dist) * push;
+        }
+      }
+
+      // Subtle ripple startle response
+      for (let r = 0; r < impulses.length; r++) {
+        const imp = impulses[r];
+        const age = elapsedSec - imp.startTime;
+        if (age < 0 || age > 1.2) continue;
+        const dx = koi.x - imp.x;
+        const dz = koi.z - imp.z;
+        const dist = Math.hypot(dx, dz);
+        if (dist > 0.01 && dist < 0.95) {
+          const strength = (1 - dist / 0.95) * (1 - age / 1.2);
+          steerX += (dx / dist) * strength * 1.5;
+          steerZ += (dz / dist) * strength * 1.5;
+          koi.burst = Math.max(koi.burst, strength * 0.45);
+        }
+      }
+
+      desiredYaw = Math.atan2(steerX, steerZ);
+      maxTurnRate = 1.2;
+    }
+
+    const yawDiff = wrapAngleRad(desiredYaw - koi.yaw);
+    const maxDelta = maxTurnRate * dt;
+    const appliedDelta = Math.max(-maxDelta, Math.min(maxDelta, yawDiff));
+    koi.yaw = wrapAngleRad(koi.yaw + appliedDelta);
+
+    const turnRate = appliedDelta / dt;
+    const targetBend = Math.max(-0.25, Math.min(0.25, -turnRate * 0.16));
+    const bendAlpha = 1 - Math.exp(-5.5 * dt);
+    koi.turnBend += (targetBend - koi.turnBend) * bendAlpha;
+
+    const targetSpeed = koi.spec.baseSpeed * (1 + koi.burst * 0.72);
+    const speedAlpha = 1 - Math.exp(-3.2 * dt);
+    koi.speed += (targetSpeed - koi.speed) * speedAlpha;
+
+    koi.vx = Math.sin(koi.yaw) * koi.speed;
+    koi.vz = Math.cos(koi.yaw) * koi.speed;
+    koi.x += koi.vx * dt;
+    koi.z += koi.vz * dt;
+    koi.swimPhase += dt * (4.2 + koi.speed * 6.8);
+  }
+
+  // Post-step hard separation for same-depth-layer overlaps and obstacle interiors
+  for (let i = 0; i < agents.length; i++) {
+    const a = agents[i];
+    for (let j = i + 1; j < agents.length; j++) {
+      const b = agents[j];
+      if (Math.abs(a.spec.depthOffset - b.spec.depthOffset) > 0.045) continue;
+      const dx = a.x - b.x;
+      const dz = a.z - b.z;
+      const dist = Math.hypot(dx, dz);
+      const minDist = 0.34;
+      if (dist > 0.0001 && dist < minDist) {
+        const push = (minDist - dist) * 0.5;
+        const nx = dx / dist;
+        const nz = dz / dist;
+        a.x += nx * push;
+        a.z += nz * push;
+        b.x -= nx * push;
+        b.z -= nz * push;
+      }
+    }
+
+    const postObs = nearestObstacleSeparation(a.x, a.z, 0.25, checkBookOverhang, true);
+    if (postObs.dist < 0) {
+      a.x += postObs.nx * (-postObs.dist + 0.004);
+      a.z += postObs.nz * (-postObs.dist + 0.004);
+      if (a.evadeTimer <= 0.1) {
+        const lagoonTargetZ = a.z >= 0 ? 0.98 : -1.14;
+        const toLagoonX = 0 - a.x;
+        const toLagoonZ = lagoonTargetZ - a.z;
+        const toLagoonLen = Math.hypot(toLagoonX, toLagoonZ) || 1;
+        const ex = postObs.nx + (toLagoonX / toLagoonLen) * 0.4;
+        const ez = postObs.nz + (toLagoonZ / toLagoonLen) * 0.4;
+        a.evadeYaw = Math.atan2(ex, ez);
+        a.evadeTimer = 1.35;
+        a.burst = Math.max(a.burst, 0.28);
+      }
+    }
+
+    a.x = Math.max(-(marginX + 0.25), Math.min(marginX + 0.25, a.x));
+    a.z = Math.max(-(marginZ + 0.22), Math.min(marginZ + 0.22, a.z));
+  }
 }
 
 export function createKoiSchool(
   waterY: number,
-  _bedY: number,
+  bedY: number,
   maxAnisotropy: number,
 ): KoiSchoolRig {
+  const shadowDiscY = Math.min(waterY - 0.24, bedY + 0.015);
   const disposables: Array<{ dispose: () => void }> = [];
   const group = new THREE.Group();
   group.name = 'pond-koi-school-group';
@@ -753,117 +1456,21 @@ export function createKoiSchool(
   });
   disposables.push(shadowDiscTex, shadowDiscGeo, shadowDiscMat);
 
-  // 6 authentic koi varieties patrolling strictly inside visible open-water corridors with staggered non-crowding loops
-  const koiSpecs: KoiSpec[] = [
-    {
-      variety: 0, // Kohaku (lower-center right loop)
-      scaleVar: 1.0,
-      length: 0.56,
-      depthOffset: 0.105,
-      baseSpeed: 0.22,
-      initX: -0.32,
-      initZ: 0.96,
-      initYaw: 1.48,
-      phase: 0.0,
-      waypoints: [
-        { x: -0.45, z: 0.92 },
-        { x: 0.55, z: 0.98 },
-        { x: 1.02, z: 1.12 },
-        { x: 0.25, z: 1.28 },
-        { x: -0.78, z: 1.16 },
-      ],
-    },
-    {
-      variety: 4, // Yamabuki Ogon (spacious lower-left & bottom-center open channel clear of lotus pads)
-      scaleVar: 0.93,
-      length: 0.52,
-      depthOffset: 0.135,
-      baseSpeed: 0.20,
-      initX: -0.96,
-      initZ: 1.06,
-      initYaw: 1.95,
-      phase: 1.35,
-      waypoints: [
-        { x: -1.24, z: 1.18 },
-        { x: -1.86, z: 1.24 },
-        { x: -0.68, z: 1.28 },
-        { x: 0.18, z: 1.12 },
-        { x: -0.58, z: 0.96 },
-      ],
-    },
-    {
-      variety: 3, // Showa (upper-right & center-top lane)
-      scaleVar: 1.08,
-      length: 0.59,
-      depthOffset: 0.095,
-      baseSpeed: 0.23,
-      initX: 0.42,
-      initZ: -0.95,
-      initYaw: -1.58,
-      phase: 2.6,
-      waypoints: [
-        { x: 0.86, z: -0.92 },
-        { x: 0.05, z: -1.04 },
-        { x: -0.88, z: -0.94 },
-        { x: -0.35, z: -1.26 },
-        { x: 0.72, z: -1.20 },
-      ],
-    },
-    {
-      variety: 1, // Deep Crimson Kohaku (lower-right open water & upper-right channel clear of card lily pad & boulders)
-      scaleVar: 0.96,
-      length: 0.54,
-      depthOffset: 0.125,
-      baseSpeed: 0.21,
-      initX: 0.96,
-      initZ: 1.04,
-      initYaw: 1.35,
-      phase: 3.9,
-      waypoints: [
-        { x: 1.48, z: 1.22 },
-        { x: 0.45, z: 1.26 },
-        { x: 0.14, z: 0.96 },
-        { x: 0.96, z: 0.98 },
-        { x: 1.16, z: 1.18 },
-      ],
-    },
-    {
-      variety: 2, // Shiro Utsuri (lower-left & wide clockwise sweep)
-      scaleVar: 1.04,
-      length: 0.57,
-      depthOffset: 0.115,
-      baseSpeed: 0.20,
-      initX: 0.86,
-      initZ: 1.02,
-      initYaw: -1.78,
-      phase: 5.05,
-      waypoints: [
-        { x: -0.12, z: 0.94 },
-        { x: -1.16, z: 0.88 },
-        { x: -1.24, z: -0.78 },
-        { x: 0.15, z: -0.90 },
-        { x: 1.02, z: 0.16 },
-      ],
-    },
-    {
-      variety: 5, // Platinum Ogon (upper-left & north bank patrol)
-      scaleVar: 0.88,
-      length: 0.50,
-      depthOffset: 0.145,
-      baseSpeed: 0.21,
-      initX: -1.08,
-      initZ: -0.90,
-      initYaw: 1.38,
-      phase: 4.35,
-      waypoints: [
-        { x: -0.45, z: -0.88 },
-        { x: 0.52, z: -0.96 },
-        { x: 0.98, z: -0.14 },
-        { x: 0.58, z: 0.94 },
-        { x: -0.82, z: 0.96 },
-      ],
-    },
-  ];
+  const sharedCausticTime = { value: 0 };
+  const sharedWaveTex: { value: THREE.Texture | null } = { value: null };
+  const sharedWaveTexel = { value: new THREE.Vector2(1 / 384, 1 / 384) };
+  const sharedPondBounds = {
+    value: new THREE.Vector4(
+      POND_BOUNDS.minX,
+      POND_BOUNDS.maxX,
+      POND_BOUNDS.minZ,
+      POND_BOUNDS.maxZ,
+    ),
+  };
+
+  // 6 authentic koi varieties across 3 staggered depth layers (0.085, 0.175, 0.265)
+  // patrolling clear North & South open-water lagoons without crossing blocked book/rock barriers
+  const koiSpecs: KoiSpec[] = KOI_PATROL_SPECS;
 
   const agents: KoiAgent[] = [];
   let disposed = false;
@@ -882,17 +1489,20 @@ export function createKoiSchool(
       const gltf = await loader.parseAsync(buffer, '/model/');
       if (disposed) return;
 
-      // Option 3: Un-bend frozen C-curve koi geometry once at load time before cloning & normalizing
-      gltf.scene.traverse((obj) => {
+      // 1. Bake all parent/node transforms into cloned geometries so +Y is dorsal-up & (X,Z) horizontal swim plane
+      const bakedScene = bakeKoiSceneTransforms(gltf.scene);
+
+      // 2. Un-bend frozen C-curve koi geometry cleanly onto straight +Z
+      bakedScene.traverse((obj) => {
         if (obj instanceof THREE.Mesh && obj.geometry) {
           straightenKoiGeometry(obj.geometry);
         }
       });
 
-      const prototype = buildNormalizedKoiPrototype(gltf.scene);
+      const prototype = buildNormalizedKoiPrototype(bakedScene);
       const hasAnimations = gltf.animations && gltf.animations.length > 0;
 
-      // Capture prototype mesh -> outer normalized prototype transforms cleanly
+      // Capture prototype mesh -> outer normalized prototype transforms cleanly & configure shared texture once
       const protoMeshMatrices = new Map<string, THREE.Matrix4>();
       prototype.updateMatrixWorld(true);
       let meshIdx = 0;
@@ -900,6 +1510,14 @@ export function createKoiSchool(
         if (obj instanceof THREE.Mesh) {
           obj.userData.__koiMeshIdx = meshIdx;
           protoMeshMatrices.set(String(meshIdx), obj.matrixWorld.clone());
+          const origMats = Array.isArray(obj.material) ? obj.material : [obj.material];
+          origMats.forEach((origMat) => {
+            if (origMat instanceof THREE.MeshStandardMaterial && origMat.map) {
+              origMat.map.colorSpace = THREE.SRGBColorSpace;
+              origMat.map.anisotropy = maxAnisotropy;
+              origMat.map.needsUpdate = true;
+            }
+          });
           meshIdx++;
         }
       });
@@ -913,7 +1531,7 @@ export function createKoiSchool(
         root.add(cloned);
 
         const timeUniform = { value: 0 };
-        const freqUniform = { value: 6.4 };
+        const freqUniform = { value: 1.0 };
         const bendUniform = { value: 0 };
 
         let mIdx = 0;
@@ -938,15 +1556,9 @@ export function createKoiSchool(
             mat = new THREE.MeshStandardMaterial({ color: 0xffffff });
           }
 
-          if (mat.map) {
-            mat.map.colorSpace = THREE.SRGBColorSpace;
-            mat.map.anisotropy = maxAnisotropy;
-            mat.map.needsUpdate = true;
-          }
-
-          mat.roughness = spec.variety === 4 ? 0.22 : spec.variety === 5 ? 0.20 : 0.25;
-          mat.metalness = spec.variety === 4 ? 0.34 : spec.variety === 5 ? 0.22 : 0.06;
-          mat.envMapIntensity = 0.42;
+          mat.roughness = 0.19;
+          mat.metalness = spec.variety === 4 ? 0.18 : spec.variety === 5 ? 0.14 : 0.06;
+          mat.envMapIntensity = 0.66;
 
           attachKoiVarietyAndSwimShader(
             mat,
@@ -957,6 +1569,10 @@ export function createKoiSchool(
             timeUniform,
             freqUniform,
             bendUniform,
+            sharedCausticTime,
+            sharedWaveTex,
+            sharedWaveTexel,
+            sharedPondBounds,
             spec.phase,
             !hasAnimations,
           );
@@ -983,7 +1599,7 @@ export function createKoiSchool(
 
         const shadowDisc = new THREE.Mesh(shadowDiscGeo, shadowDiscMat);
         shadowDisc.scale.set(actualLen * 0.46, 1, actualLen * 1.15);
-        shadowDisc.position.set(spec.initX, waterY - 0.56, spec.initZ);
+        shadowDisc.position.set(spec.initX, shadowDiscY, spec.initZ);
         shadowDisc.rotation.y = spec.initYaw;
         group.add(shadowDisc);
 
@@ -1001,13 +1617,23 @@ export function createKoiSchool(
           speed: spec.baseSpeed,
           burst: 0,
           turnBend: 0,
+          swimPhase: 0,
           wanderPhase: idx * 1.4,
           waypointIndex: 0,
+          anchorX: spec.initX,
+          anchorZ: spec.initZ,
+          stuckTimer: 0,
+          evadeTimer: 0,
+          evadeYaw: spec.initYaw,
           timeUniform,
           freqUniform,
           bendUniform,
         });
       });
+
+      if (typeof document !== 'undefined') {
+        document.body.dataset.koiCount = String(agents.length);
+      }
 
       // Dispose uncloned original textures/geometries when cleanup runs
       prototype.traverse((obj) => {
@@ -1024,174 +1650,40 @@ export function createKoiSchool(
           });
         }
       });
-    } catch {
-      // Fail gracefully without crashing scene if GLB is temporarily unavailable
+    } catch (err) {
+      if (typeof document !== 'undefined') {
+        document.body.dataset.koiCount = 'error';
+      }
+      console.error('[KoiSchool] Failed to initialize koi.glb:', err);
     }
   })();
-
-  const wrapAngle = (a: number) => {
-    let r = a;
-    while (r > Math.PI) r -= Math.PI * 2;
-    while (r < -Math.PI) r += Math.PI * 2;
-    return r;
-  };
-
-  const marginX = 2.34;
-  const marginZ = 1.50;
 
   return {
     group,
     update: (dtSec, elapsedSec, waterSim, _renderer, bookOpenProgress = 0) => {
+      sharedCausticTime.value = elapsedSec;
+      sharedWaveTex.value = waterSim.texture;
+      sharedWaveTexel.value.copy(waterSim.texelSize);
+
       if (agents.length === 0) return;
       const dt = Math.min(0.045, Math.max(0.001, dtSec));
       const impulses = waterSim.getRecentImpulses();
       const checkBookOverhang = bookOpenProgress > 0.08;
 
-      for (let i = 0; i < agents.length; i++) {
-        const koi = agents[i];
-        const wp = koi.spec.waypoints[koi.waypointIndex];
+      stepKoiSchoolMotion(agents, dt, elapsedSec, impulses, checkBookOverhang);
 
-        const toWpX = wp.x - koi.x;
-        const toWpZ = wp.z - koi.z;
-        const wpDist = Math.hypot(toWpX, toWpZ);
-        if (wpDist < 0.42) {
-          koi.waypointIndex = (koi.waypointIndex + 1) % koi.spec.waypoints.length;
-        }
-
-        const dirX = wpDist > 0.001 ? toWpX / wpDist : Math.sin(koi.yaw);
-        const dirZ = wpDist > 0.001 ? toWpZ / wpDist : Math.cos(koi.yaw);
-
-        const swayAngle = Math.sin(elapsedSec * 0.44 + koi.wanderPhase) * 0.2;
-        const cosS = Math.cos(swayAngle);
-        const sinS = Math.sin(swayAngle);
-        let steerX = dirX * cosS - dirZ * sinS;
-        let steerZ = dirX * sinS + dirZ * cosS;
-
-        // Smooth obstacle avoidance (plank + open book overhang + boulders + lantern rock + lily pads)
-        const sep = nearestObstacleSeparation(koi.x, koi.z, 0.24, checkBookOverhang, true);
-        if (sep.dist < 0.42) {
-          const push = (0.42 - sep.dist) / 0.42;
-          const strength = sep.dist < 0 ? 5.6 + push * 4.5 : push * 3.1;
-          steerX += sep.nx * strength;
-          steerZ += sep.nz * strength;
-        }
-
-        // Keep koi strictly inside visible pond water corridors
-        if (Math.abs(koi.x) > marginX) {
-          steerX -= Math.sign(koi.x) * (Math.abs(koi.x) - marginX) * 4.8;
-        }
-        if (Math.abs(koi.z) > marginZ) {
-          steerZ -= Math.sign(koi.z) * (Math.abs(koi.z) - marginZ) * 4.8;
-        }
-
-        // Gentle curiosity/startle reaction to recent water ripples
-        let rippleTargetSpeed = koi.spec.baseSpeed;
-        for (let r = 0; r < impulses.length; r++) {
-          const imp = impulses[r];
-          const age = elapsedSec - imp.startTime;
-          if (age < 0 || age > 1.8) continue;
-          const dx = koi.x - imp.x;
-          const dz = koi.z - imp.z;
-          const d = Math.hypot(dx, dz);
-          if (d < 0.75 && d > 0.01) {
-            const awayWeight = (1 - d / 0.75) * Math.exp(-age * 1.8);
-            steerX += (dx / d) * awayWeight * 1.4;
-            steerZ += (dz / d) * awayWeight * 1.4;
-            koi.burst = Math.max(koi.burst, awayWeight * 0.45);
-          }
-        }
-
-        // Strong pairwise koi separation + tangential swirl deflection so koi glide cleanly past each other
-        for (let j = 0; j < agents.length; j++) {
-          if (i === j) continue;
-          const other = agents[j];
-          const dx = koi.x - other.x;
-          const dz = koi.z - other.z;
-          const d = Math.hypot(dx, dz);
-          const safeDist = (koi.spec.length + other.spec.length) * 0.74 + 0.26;
-          if (d < safeDist && d > 0.001) {
-            const nx = dx / d;
-            const nz = dz / d;
-            const rep = Math.pow((safeDist - d) / safeDist, 1.25) * 6.2;
-            const sideSign = i < j ? 1 : -1;
-            steerX += nx * rep - nz * rep * 0.45 * sideSign;
-            steerZ += nz * rep + nx * rep * 0.45 * sideSign;
-          }
-        }
-
-        const desiredYaw = Math.atan2(steerX, steerZ);
-        const yawDiff = wrapAngle(desiredYaw - koi.yaw);
-        const maxTurnRate = 2.15 * dt;
-        const dYaw = THREE.MathUtils.clamp(yawDiff, -maxTurnRate, maxTurnRate);
-        koi.yaw = wrapAngle(koi.yaw + dYaw);
-
-        const targetBend = THREE.MathUtils.clamp(-yawDiff * 0.24, -0.14, 0.14);
-        koi.turnBend += (targetBend - koi.turnBend) * Math.min(1, dt * 6.5);
-
-        koi.burst = Math.max(0, koi.burst - dt * 0.65);
-        rippleTargetSpeed += koi.burst * 0.16;
-        koi.speed += (rippleTargetSpeed - koi.speed) * Math.min(1, dt * 3.2);
-
-        koi.vx = Math.sin(koi.yaw) * koi.speed;
-        koi.vz = Math.cos(koi.yaw) * koi.speed;
-        koi.x += koi.vx * dt;
-        koi.z += koi.vz * dt;
-      }
-
-      // Alternating pairwise + obstacle collision resolution (3 iterations) so koi NEVER overlap each other or clip obstacles
-      for (let iter = 0; iter < 3; iter++) {
-        for (let i = 0; i < agents.length; i++) {
-          for (let j = i + 1; j < agents.length; j++) {
-            const a = agents[i];
-            const b = agents[j];
-            const dx = b.x - a.x;
-            const dz = b.z - a.z;
-            const dist = Math.hypot(dx, dz);
-            const minCenterDist = (a.spec.length + b.spec.length) * 0.62 + 0.24;
-            if (dist < minCenterDist) {
-              const nx = dist > 0.0005 ? dx / dist : Math.cos(i * 1.3);
-              const nz = dist > 0.0005 ? dz / dist : Math.sin(i * 1.3);
-              const overlap = (minCenterDist - dist) * 0.52;
-              a.x -= nx * overlap;
-              a.z -= nz * overlap;
-              b.x += nx * overlap;
-              b.z += nz * overlap;
-              if (iter === 0) {
-                const yawA = Math.atan2(-nx, -nz);
-                const yawB = Math.atan2(nx, nz);
-                a.yaw = wrapAngle(a.yaw + wrapAngle(yawA - a.yaw) * 0.16);
-                b.yaw = wrapAngle(b.yaw + wrapAngle(yawB - b.yaw) * 0.16);
-              }
-            }
-          }
-        }
-
-        for (let i = 0; i < agents.length; i++) {
-          const koi = agents[i];
-          const postObs = nearestObstacleSeparation(koi.x, koi.z, 0.21, checkBookOverhang, true);
-          if (postObs.dist < 0) {
-            koi.x += postObs.nx * (-postObs.dist + 0.015);
-            koi.z += postObs.nz * (-postObs.dist + 0.015);
-            if (iter === 0) {
-              const pushYaw = Math.atan2(postObs.nx, postObs.nz);
-              koi.yaw = wrapAngle(koi.yaw + wrapAngle(pushYaw - koi.yaw) * 0.28);
-            }
-          }
-        }
-      }
-
-      // Sync final world transforms, vertex swim uniforms / animation mixers, and bed shadows
+      // Sync final world transforms, smoothly accumulated swimPhase (zero phase-jump!), and bed shadows
       for (let i = 0; i < agents.length; i++) {
         const koi = agents[i];
         const depthY =
-          waterY - koi.spec.depthOffset + Math.sin(elapsedSec * 0.72 + koi.spec.phase) * 0.007;
+          waterY - koi.spec.depthOffset + Math.sin(elapsedSec * 0.72 + koi.spec.phase) * 0.005;
 
         koi.root.position.set(koi.x, depthY, koi.z);
         koi.root.rotation.y = koi.yaw;
-        koi.root.rotation.z = THREE.MathUtils.clamp(-koi.turnBend * 0.7, -0.1, 0.1);
+        koi.root.rotation.z = THREE.MathUtils.clamp(-koi.turnBend * 0.32, -0.075, 0.075);
 
-        koi.timeUniform.value = elapsedSec;
-        koi.freqUniform.value = 5.4 + koi.speed * 10.0;
+        koi.timeUniform.value = koi.swimPhase;
+        koi.freqUniform.value = 1.0;
         koi.bendUniform.value = koi.turnBend;
 
         if (koi.mixer && koi.action) {
@@ -1199,7 +1691,7 @@ export function createKoiSchool(
           koi.mixer.update(dt);
         }
 
-        koi.shadowDisc.position.set(koi.x + 0.035, waterY - 0.54, koi.z + 0.035);
+        koi.shadowDisc.position.set(koi.x + 0.035, shadowDiscY, koi.z + 0.035);
         koi.shadowDisc.rotation.y = koi.yaw;
       }
     },
@@ -1208,7 +1700,7 @@ export function createKoiSchool(
       for (const a of agents) {
         if (a.mixer) a.mixer.stopAllAction();
       }
-      disposables.forEach((d) => d.dispose());
+      new Set(disposables).forEach((d) => d.dispose());
     },
   };
 }

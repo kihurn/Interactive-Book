@@ -1,16 +1,19 @@
 import * as THREE from 'three';
-import { POND_LAYOUT } from './constants';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { POND_CAUSTICS_GLSL } from './causticsShader';
+import { POND_BOUNDS, POND_LAYOUT } from './constants';
 import {
   createCreepingMossMatGeometry,
   createMossClumpTextures,
   createVelvetyMossMaterial,
 } from './FloatingPlank';
+import type { WaterSimulation } from './WaterSimulation';
 
 export interface PondLanternRig {
   group: THREE.Group;
   aboveWaterGroup: THREE.Group;
   pointLight: THREE.PointLight;
-  update: (elapsedSec: number) => void;
+  update: (elapsedSec: number, waterSim?: WaterSimulation) => void;
   dispose: () => void;
 }
 
@@ -187,58 +190,65 @@ function createWeatheredLanternGraniteMaps(maxAnisotropy: number): {
   };
 }
 
+function evaluateLanternBoulderVertex(
+  dir: THREE.Vector3,
+  radius: number,
+  aboveWater: number,
+  seed: number,
+  out: THREE.Vector3,
+  withLanternPocket = true,
+): THREE.Vector3 {
+  const n1 = fbm3DLantern(dir.x * 1.25 + 1.8, dir.y * 1.25 + 1.8, dir.z * 1.25 + 1.8, seed);
+  const n2 = fbm3DLantern(dir.x * 2.3 + 4.1, dir.y * 2.3 + 2.6, dir.z * 2.3 + 3.4, seed + 15.4);
+
+  // Smooth rounded river-cobble silhouette matching the pond's emergent stones
+  const rMod = 0.90 + (n1 - 0.5) * 0.19 + (n2 - 0.5) * 0.07;
+
+  // Gentle asymmetric river-boulder proportions curving naturally inward underwater
+  const shoulderBias =
+    1.0 +
+    Math.max(0, dir.x * 0.65 + dir.z * 0.45) * 0.14 +
+    Math.max(0, -dir.x * 0.4 + dir.z * 0.3) * 0.08;
+
+  const px = dir.x * rMod * radius * 1.14 * shoulderBias;
+  const pz = dir.z * rMod * radius * 0.96 * shoulderBias;
+
+  const asymSlope = 1.0 + (-dir.x * 0.09 - dir.z * 0.07);
+  const baseHalfH = Math.max(aboveWater * 1.08, radius * 0.48);
+  const underFlatten = dir.y < 0 ? 0.90 : 1.0;
+  let scaledY = dir.y * rMod * asymSlope * baseHalfH * underFlatten;
+
+  // Subtle small natural cradle pocket tucked directly beneath the 3 lantern legs
+  if (withLanternPocket && dir.y > 0.18) {
+    const rXZ = Math.hypot(px, pz);
+    const pocketWeight = 1.0 - Math.min(1, Math.max(0, (rXZ - 0.095) / (0.148 - 0.095)));
+    const smoothPocket = pocketWeight * pocketWeight * (3 - 2 * pocketWeight);
+    const pocketY = 0.057 + (n1 - 0.5) * 0.004;
+    scaledY = THREE.MathUtils.lerp(scaledY, pocketY, smoothPocket);
+  }
+
+  return out.set(px, scaledY, pz);
+}
+
 /**
- * Sculpts a wide, multi-faceted granite boulder platform with planar cleavage bevels,
- * a level upper shelf for the Yukimi-doro lantern legs, and broad sunlit front-right
- * granite shoulders extending past the lantern roof shadow.
+ * Sculpts a smooth, rounded river-granite cobble boulder matching the right-side stones,
+ * curving naturally inward beneath the waterline rather than stretching into a vertical cylinder.
  */
 function createSculptedLanternBoulderGeometry(
   radius: number,
   aboveWater: number,
-  belowWater: number,
+  seed = 14.3,
+  withLanternPocket = true,
 ): THREE.BufferGeometry {
-  const geo = new THREE.IcosahedronGeometry(1, 4);
+  const geo = new THREE.IcosahedronGeometry(1, 3);
   const pos = geo.attributes.position as THREE.BufferAttribute;
 
-  const planes = Array.from({ length: 5 }, (_, k) => {
-    const a = k * 1.92 + 1.15;
-    const elev = 0.24 + ((k * 0.34) % 0.62);
-    return new THREE.Vector3(
-      Math.cos(a) * Math.cos(elev),
-      Math.sin(elev),
-      Math.sin(a) * Math.cos(elev),
-    ).normalize();
-  });
-
   const v = new THREE.Vector3();
+  const out = new THREE.Vector3();
   for (let i = 0; i < pos.count; i++) {
     v.set(pos.getX(i), pos.getY(i), pos.getZ(i)).normalize();
-
-    const n1 = fbm3DLantern(v.x * 1.85 + 2.0, v.y * 1.85 + 2.0, v.z * 1.85 + 2.0, 14.3);
-    let rMod = 0.88 + n1 * 0.26;
-
-    for (let p = 0; p < planes.length; p++) {
-      const dot = v.dot(planes[p]);
-      if (dot > 0.50) {
-        rMod -= (dot - 0.50) * 0.21;
-      }
-    }
-
-    // Flat horizontal shelf atop boulder for stable 3-leg seating + terraced front-right shoulder
-    let py = v.y * rMod;
-    if (py > 0.38) {
-      py = 0.38 + (py - 0.38) * 0.22;
-    }
-
-    // Broad sunlit front-right shoulder extension (+X / +Z) protruding clearly beyond the 0.214m kasa roof shadow
-    const shoulderBias =
-      1.0 + Math.max(0, v.x * 0.62 + v.z * 0.42) * 0.18;
-
-    const px = v.x * rMod * radius * 1.15 * shoulderBias;
-    const pz = v.z * rMod * radius * 0.98 * shoulderBias;
-    const scaledY = py >= 0 ? py * aboveWater * 1.38 : py * belowWater * 1.38;
-
-    pos.setXYZ(i, px, scaledY, pz);
+    evaluateLanternBoulderVertex(v, radius, aboveWater, seed, out, withLanternPocket);
+    pos.setXYZ(i, out.x, out.y, out.z);
   }
 
   geo.computeVertexNormals();
@@ -303,6 +313,16 @@ export function createPondLantern(
 
   const causticTimeUniform = { value: 0 };
   const flickerUniform = { value: 1.0 };
+  const waveTexUniform: { value: THREE.Texture | null } = { value: null };
+  const waveTexelUniform = { value: new THREE.Vector2(1 / 128, 1 / 128) };
+  const pondBoundsUniform = {
+    value: new THREE.Vector4(
+      POND_BOUNDS.minX,
+      POND_BOUNDS.maxX,
+      POND_BOUNDS.minZ,
+      POND_BOUNDS.maxZ,
+    ),
+  };
   const pedestalTopY = waterY + 0.068;
   const fireboxCenterLocalY = pedestalTopY + 0.073 + 0.048;
 
@@ -317,6 +337,9 @@ export function createPondLantern(
       shader.uniforms.uMossBias = { value: mossBias };
       shader.uniforms.uCausticTime = causticTimeUniform;
       shader.uniforms.uFlicker = flickerUniform;
+      shader.uniforms.tWave = waveTexUniform;
+      shader.uniforms.uWaveTexel = waveTexelUniform;
+      shader.uniforms.uPondBounds = pondBoundsUniform;
       shader.uniforms.uBounceOrigin = {
         value: new THREE.Vector3(x, fireboxCenterLocalY, z),
       };
@@ -343,50 +366,13 @@ export function createPondLantern(
           uniform float uMossBias;
           uniform float uCausticTime;
           uniform float uFlicker;
+          uniform sampler2D tWave;
+          uniform vec2 uWaveTexel;
+          uniform vec4 uPondBounds;
           uniform vec3 uBounceOrigin;
           varying vec3 vLanternWorld;
           varying vec3 vLanternWorldN;
-
-          vec2 lanternHash2(vec2 p) {
-            p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
-            return fract(sin(p) * 43758.5453123);
-          }
-
-          float lanternVoronoiEdge(vec2 x, float t) {
-            vec2 n = floor(x);
-            vec2 f = fract(x);
-            float d1 = 8.0;
-            float d2 = 8.0;
-            for (int j = -1; j <= 1; j++) {
-              for (int i = -1; i <= 1; i++) {
-                vec2 g = vec2(float(i), float(j));
-                vec2 o = lanternHash2(n + g);
-                o = 0.5 + 0.44 * sin(t + 6.2831 * o);
-                vec2 r = g - f + o;
-                float d = dot(r, r);
-                if (d < d1) {
-                  d2 = d1;
-                  d1 = d;
-                } else if (d < d2) {
-                  d2 = d;
-                }
-              }
-            }
-            return pow(clamp(1.0 - abs(sqrt(d2) - sqrt(d1)) * 4.4, 0.0, 1.0), 3.6);
-          }
-
-          float lanternCausticArcs(vec2 p, float t) {
-            vec2 warp = vec2(
-              sin(p.y * 1.6 + t * 0.42) + cos(p.x * 1.1 - t * 0.35) * 0.5,
-              cos(p.x * 1.5 - t * 0.38) + sin(p.y * 1.2 + t * 0.31) * 0.5
-            ) * 0.24;
-            float f1 = lanternVoronoiEdge((p + warp) * 1.55, t * 0.72);
-            float f2 = lanternVoronoiEdge((mat2(0.8, -0.6, 0.6, 0.8) * (p - warp * 0.8)) * 1.95 + vec2(3.7, -2.1), -t * 0.58 + 1.9);
-            float break1 = smoothstep(0.08, 0.68, sin(p.x * 1.85 - p.y * 1.35 + t * 0.28 + sin(p.y * 2.1) * 0.7));
-            float break2 = smoothstep(0.08, 0.68, cos(p.x * 1.55 + p.y * 1.75 - t * 0.24 + cos(p.x * 1.9) * 0.7));
-            float sunPocket = smoothstep(-0.12, 0.52, sin(p.x * 0.85 + t * 0.14) * cos(p.y * 0.95 - t * 0.12));
-            return clamp(f1 * break1 + f2 * break2 * 0.78, 0.0, 1.0) * (0.30 + 0.70 * sunPocket);
-          }`,
+          ${POND_CAUSTICS_GLSL}`,
         )
         .replace(
           '#include <color_fragment>',
@@ -417,16 +403,28 @@ export function createPondLantern(
         .replace(
           '#include <lights_fragment_end>',
           `#include <lights_fragment_end>
-          // Subtle sunlit underwater caustics across submerged granite boulder facets
+          // Eliminate specular & environment reflections on submerged rock surfaces underwater
+          float lSubmerged = 1.0 - smoothstep(uWaterY - 0.018, uWaterY + 0.006, vLanternWorld.y);
+          reflectedLight.directSpecular *= (1.0 - lSubmerged);
+          reflectedLight.indirectSpecular *= (1.0 - lSubmerged);
+
+          // Subtle wave-driven underwater caustics across submerged granite boulder facets
           float lSubMask = 1.0 - smoothstep(uWaterY - 0.06, uWaterY + 0.01, vLanternWorld.y);
           if (lSubMask > 0.01) {
-            float lCaustic = lanternCausticArcs(vLanternWorld.xz, uCausticTime * 0.82);
-            float lEdgeFade = exp(-dot(vLanternWorld.xz, vLanternWorld.xz) * 0.10);
-            reflectedLight.directDiffuse += vec3(0.88, 0.95, 0.89) * (lCaustic * 0.14) * lSubMask * lEdgeFade;
+            float lShadow = 1.0;
+            #if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+              DirectionalLightShadow lDirShadow = directionalLightShadows[ 0 ];
+              lShadow = receiveShadow ? getShadow( directionalShadowMap[ 0 ], lDirShadow.shadowMapSize, lDirShadow.shadowIntensity, lDirShadow.shadowBias, lDirShadow.shadowRadius, vDirectionalShadowCoord[ 0 ] ) : 1.0;
+            #endif
+            float lWaveCaustic = pondWaveLaplacianCaustic(tWave, uWaveTexel, uPondBounds, vLanternWorld, uWaterY);
+            float lThreads = pondAmbientSunThreads(vLanternWorld.xz, uCausticTime);
+            float lCover = pondCausticCoverMask(vLanternWorld.xz, lShadow);
+            float lEdgeFade = exp(-dot(vLanternWorld.xz, vLanternWorld.xz) * 0.09);
+            reflectedLight.directDiffuse += vec3(1.0, 0.94, 0.76) * (lWaveCaustic * 0.18 + lThreads * 0.09) * lSubMask * lCover * lEdgeFade;
           }`,
         );
     };
-    mat.customProgramCacheKey = () => `${cacheKey}-voronoi-v3`;
+    mat.customProgramCacheKey = () => `${cacheKey}-laplacian-v7`;
   };
 
   const stoneMat = new THREE.MeshStandardMaterial({
@@ -465,48 +463,93 @@ export function createPondLantern(
   });
   attachStoneRimShader(roofGraniteMat, 0.65, false, 'lantern-roof-granite-rim-v5');
 
-  // 1. Wide sculpted granite boulder matching the exact underwater/above-water proportions of top-right boulders
-  const boulderGeo = createSculptedLanternBoulderGeometry(0.365, 0.135, 0.175);
+  // 1. Roundish river-granite boulder supported underneath by nestled submerged river stones on the shallow bed
+  const lanternBoulderRadius = 0.355;
+  const lanternAboveWater = 0.12;
+  const boulderGeo = createSculptedLanternBoulderGeometry(
+    lanternBoulderRadius,
+    lanternAboveWater,
+  );
   const baseRock = new THREE.Mesh(boulderGeo, boulderPlatformMat);
-  baseRock.position.set(0.03, waterY + 0.006, 0.02);
-  baseRock.rotation.y = 0.35;
+  baseRock.position.set(0, waterY, 0);
+  baseRock.rotation.y = 0.18;
   baseRock.castShadow = true;
   baseRock.receiveShadow = true;
   group.add(baseRock);
 
-  // Dark shadowy submerged reef shoal underneath boulder anchoring into pond floor
-  const shoalH = Math.max(0.1, waterY - 0.12 - bedY + 0.06);
-  const shoalGeo = new THREE.CylinderGeometry(0.28, 0.44, shoalH, 14);
-  const shoalMat = new THREE.MeshStandardMaterial({
-    color: 0x161d1e,
-    roughness: 0.94,
-    metalness: 0.02,
+  const lanternBaseStones: Array<{
+    ox: number;
+    oz: number;
+    yOffset: number;
+    radius: number;
+    height: number;
+    yaw: number;
+    seed: number;
+  }> = [
+    { ox: -0.14, oz: 0.10, yOffset: -0.24, radius: 0.25, height: 0.125, yaw: 0.65, seed: 31.2 },
+    { ox: 0.17, oz: -0.06, yOffset: -0.25, radius: 0.24, height: 0.12, yaw: -1.1, seed: 44.8 },
+    { ox: -0.02, oz: -0.16, yOffset: -0.26, radius: 0.23, height: 0.115, yaw: 2.15, seed: 58.3 },
+  ];
+  lanternBaseStones.forEach((ls) => {
+    const sGeo = createSculptedLanternBoulderGeometry(ls.radius, ls.height, ls.seed, false);
+    const sMesh = new THREE.Mesh(sGeo, boulderPlatformMat);
+    sMesh.position.set(ls.ox, Math.max(bedY + ls.height * 0.42, waterY + ls.yOffset), ls.oz);
+    sMesh.rotation.y = ls.yaw;
+    sMesh.castShadow = false;
+    sMesh.receiveShadow = true;
+    group.add(sMesh);
+    disposables.push(sGeo);
   });
-  const shoalMesh = new THREE.Mesh(shoalGeo, shoalMat);
-  shoalMesh.position.set(0.03, bedY + shoalH * 0.5 - 0.02, 0.02);
-  shoalMesh.receiveShadow = true;
-  group.add(shoalMesh);
 
-  // Low-profile velvety creeping moss mats tucked along sculpted granite boulder ledges
+  // Low-profile velvety creeping moss mats anchored onto outer granite boulder shoulders
   const lanternMossMat = createVelvetyMossMaterial(mossTex, 0xdce6cc);
   const mossGeos = [
     createCreepingMossMatGeometry(4.2),
     createCreepingMossMatGeometry(7.9),
   ];
-  const lanternMossPlacements: Array<{ x: number; y: number; z: number; sx: number; sy: number; sz: number; yaw: number }> = [
-    { x: -0.2, y: waterY + 0.044, z: 0.13, sx: 0.088, sy: 0.032, sz: 0.062, yaw: 0.8 },
-    { x: 0.22, y: waterY + 0.048, z: -0.13, sx: 0.078, sy: 0.03, sz: 0.056, yaw: 2.4 },
-    { x: 0.16, y: waterY + 0.028, z: 0.22, sx: 0.074, sy: 0.028, sz: 0.052, yaw: -0.5 },
+  const mossShoulderDirs: Array<{ ang: number; elev: number; scale: number; yaw: number }> = [
+    { ang: 2.55, elev: 0.38, scale: 0.08, yaw: 0.8 },
+    { ang: -0.58, elev: 0.36, scale: 0.072, yaw: 2.4 },
+    { ang: 0.92, elev: 0.34, scale: 0.068, yaw: -0.5 },
   ];
-  lanternMossPlacements.forEach((mp, idx) => {
-    const mMesh = new THREE.Mesh(mossGeos[idx % mossGeos.length], lanternMossMat);
-    mMesh.position.set(mp.x, mp.y, mp.z);
-    mMesh.scale.set(mp.sx, mp.sy, mp.sz);
-    mMesh.rotation.y = mp.yaw;
-    mMesh.castShadow = true;
-    mMesh.receiveShadow = true;
-    aboveWaterGroup.add(mMesh);
+  const mDir = new THREE.Vector3();
+  const mSurf = new THREE.Vector3();
+  const yAxis = new THREE.Vector3(0, 1, 0);
+  const lanternScratch = new THREE.Object3D();
+  const lanternMossParts: THREE.BufferGeometry[] = [];
+  mossShoulderDirs.forEach((mp, idx) => {
+    mDir
+      .set(
+        Math.cos(mp.ang) * Math.cos(mp.elev),
+        Math.sin(mp.elev),
+        Math.sin(mp.ang) * Math.cos(mp.elev),
+      )
+      .normalize();
+    evaluateLanternBoulderVertex(
+      mDir,
+      lanternBoulderRadius,
+      lanternAboveWater,
+      14.3,
+      mSurf,
+    );
+    mSurf.applyAxisAngle(yAxis, 0.18);
+    lanternScratch.position.set(mSurf.x, waterY + mSurf.y - 0.004, mSurf.z);
+    lanternScratch.rotation.set(0, mp.yaw, 0);
+    lanternScratch.scale.set(mp.scale, mp.scale * 0.34, mp.scale * 0.7);
+    lanternScratch.updateMatrix();
+    const part = mossGeos[idx % mossGeos.length].clone();
+    part.applyMatrix4(lanternScratch.matrix);
+    lanternMossParts.push(part);
   });
+  const mergedLanternMossGeo = mergeGeometries(lanternMossParts, false);
+  lanternMossParts.forEach((g) => g.dispose());
+  if (mergedLanternMossGeo) {
+    const lanternMossMesh = new THREE.Mesh(mergedLanternMossGeo, lanternMossMat);
+    lanternMossMesh.castShadow = true;
+    lanternMossMesh.receiveShadow = true;
+    aboveWaterGroup.add(lanternMossMesh);
+    disposables.push(mergedLanternMossGeo);
+  }
 
   // 2. Yukimi-doro 3 curved stone legs & carved chudai platform seated atop granite plateau
   const chudaiProfile = [
@@ -523,16 +566,33 @@ export function createPondLantern(
   chudaiMesh.receiveShadow = true;
   aboveWaterGroup.add(chudaiMesh);
 
-  const legGeo = new THREE.CylinderGeometry(0.02, 0.028, 0.048, 8);
+  const legProfile = [
+    new THREE.Vector2(0, -0.024),
+    new THREE.Vector2(0.029, -0.024),
+    new THREE.Vector2(0.024, 0.0),
+    new THREE.Vector2(0.020, 0.024),
+    new THREE.Vector2(0, 0.024),
+  ];
+  const legGeo = new THREE.LatheGeometry(legProfile, 8);
+  const legParts: THREE.BufferGeometry[] = [];
   for (let i = 0; i < 3; i++) {
     const ang = (i / 3) * Math.PI * 2 + 0.4;
-    const leg = new THREE.Mesh(legGeo, stoneMat);
-    leg.position.set(Math.cos(ang) * 0.092, pedestalTopY + 0.012, Math.sin(ang) * 0.092);
-    leg.rotation.z = Math.cos(ang) * 0.22;
-    leg.rotation.x = -Math.sin(ang) * 0.22;
-    leg.castShadow = true;
-    leg.receiveShadow = true;
-    aboveWaterGroup.add(leg);
+    lanternScratch.position.set(Math.cos(ang) * 0.092, pedestalTopY + 0.012, Math.sin(ang) * 0.092);
+    lanternScratch.rotation.set(-Math.sin(ang) * 0.22, 0, Math.cos(ang) * 0.22);
+    lanternScratch.scale.set(1, 1, 1);
+    lanternScratch.updateMatrix();
+    const part = legGeo.clone();
+    part.applyMatrix4(lanternScratch.matrix);
+    legParts.push(part);
+  }
+  const mergedLegsGeo = mergeGeometries(legParts, false);
+  legParts.forEach((g) => g.dispose());
+  if (mergedLegsGeo) {
+    const legsMesh = new THREE.Mesh(mergedLegsGeo, stoneMat);
+    legsMesh.castShadow = true;
+    legsMesh.receiveShadow = true;
+    aboveWaterGroup.add(legsMesh);
+    disposables.push(mergedLegsGeo);
   }
 
   // 3. Firebox (hibukuro) — warm shoji glowing core + carved granite corner pillars
@@ -546,25 +606,42 @@ export function createPondLantern(
     emissiveIntensity: 1.55,
     roughness: 0.7,
   });
-  const coreGeo = new THREE.CylinderGeometry(0.068, 0.068, fireboxHeight, 6);
+  const coreProfile = [
+    new THREE.Vector2(0, -fireboxHeight * 0.5),
+    new THREE.Vector2(0.068, -fireboxHeight * 0.5),
+    new THREE.Vector2(0.068, fireboxHeight * 0.5),
+    new THREE.Vector2(0, fireboxHeight * 0.5),
+  ];
+  const coreGeo = new THREE.LatheGeometry(coreProfile, 6);
   const coreMesh = new THREE.Mesh(coreGeo, shojiMat);
   coreMesh.position.y = fireboxY + fireboxHeight * 0.5;
   coreMesh.castShadow = true;
   aboveWaterGroup.add(coreMesh);
 
   const pillarGeo = new THREE.BoxGeometry(0.018, fireboxHeight + 0.008, 0.018);
+  const pillarParts: THREE.BufferGeometry[] = [];
   for (let i = 0; i < 6; i++) {
     const ang = (i / 6) * Math.PI * 2;
-    const pillar = new THREE.Mesh(pillarGeo, stoneMat);
-    pillar.position.set(
+    lanternScratch.position.set(
       Math.cos(ang) * 0.072,
       fireboxY + fireboxHeight * 0.5,
       Math.sin(ang) * 0.072,
     );
-    pillar.rotation.y = -ang;
-    pillar.castShadow = true;
-    pillar.receiveShadow = true;
-    aboveWaterGroup.add(pillar);
+    lanternScratch.rotation.set(0, -ang, 0);
+    lanternScratch.scale.set(1, 1, 1);
+    lanternScratch.updateMatrix();
+    const part = pillarGeo.clone();
+    part.applyMatrix4(lanternScratch.matrix);
+    pillarParts.push(part);
+  }
+  const mergedPillarsGeo = mergeGeometries(pillarParts, false);
+  pillarParts.forEach((g) => g.dispose());
+  if (mergedPillarsGeo) {
+    const pillarsMesh = new THREE.Mesh(mergedPillarsGeo, stoneMat);
+    pillarsMesh.castShadow = true;
+    pillarsMesh.receiveShadow = true;
+    aboveWaterGroup.add(pillarsMesh);
+    disposables.push(mergedPillarsGeo);
   }
 
   // 4. Sculpted curved Yukimi-doro hexagonal umbrella roof (kasa) with carved corner ridges & upturned eave rim
@@ -594,13 +671,24 @@ export function createPondLantern(
     new THREE.Vector3(0.213, 0.004, 0),
   ]);
   const ribGeo = new THREE.TubeGeometry(ribCurve, 8, 0.0075, 5, false);
+  const ribParts: THREE.BufferGeometry[] = [];
   for (let i = 0; i < 6; i++) {
-    const rib = new THREE.Mesh(ribGeo, roofGraniteMat);
-    rib.position.y = roofY + 0.008;
-    rib.rotation.y = (i / 6) * Math.PI * 2 + Math.PI / 2;
-    rib.castShadow = true;
-    rib.receiveShadow = true;
-    aboveWaterGroup.add(rib);
+    lanternScratch.position.set(0, roofY + 0.008, 0);
+    lanternScratch.rotation.set(0, (i / 6) * Math.PI * 2 + Math.PI / 2, 0);
+    lanternScratch.scale.set(1, 1, 1);
+    lanternScratch.updateMatrix();
+    const part = ribGeo.clone();
+    part.applyMatrix4(lanternScratch.matrix);
+    ribParts.push(part);
+  }
+  const mergedRibsGeo = mergeGeometries(ribParts, false);
+  ribParts.forEach((g) => g.dispose());
+  if (mergedRibsGeo) {
+    const ribsMesh = new THREE.Mesh(mergedRibsGeo, roofGraniteMat);
+    ribsMesh.castShadow = true;
+    ribsMesh.receiveShadow = true;
+    aboveWaterGroup.add(ribsMesh);
+    disposables.push(mergedRibsGeo);
   }
 
   // Finial lotus jewel (hoju)
@@ -629,8 +717,6 @@ export function createPondLantern(
     stoneMat,
     boulderPlatformMat,
     roofGraniteMat,
-    shoalGeo,
-    shoalMat,
     boulderGeo,
     lanternMossMat,
     ...mossGeos,
@@ -649,7 +735,7 @@ export function createPondLantern(
     group,
     aboveWaterGroup,
     pointLight,
-    update: (elapsedSec: number) => {
+    update: (elapsedSec: number, waterSim?: WaterSimulation) => {
       const f =
         Math.sin(elapsedSec * 5.2) * 0.07 +
         Math.sin(elapsedSec * 11.7 + 1.3) * 0.04 +
@@ -659,6 +745,10 @@ export function createPondLantern(
       shojiMat.emissiveIntensity = 1.48 * flicker;
       causticTimeUniform.value = elapsedSec;
       flickerUniform.value = flicker;
+      if (waterSim) {
+        waveTexUniform.value = waterSim.texture;
+        waveTexelUniform.value.copy(waterSim.texelSize);
+      }
     },
     dispose: () => {
       disposables.forEach((d) => d.dispose());

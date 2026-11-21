@@ -386,6 +386,8 @@ export function createBookRig(
   let lastSpreadPos = 0;
   let lastPhysicalSpreads = 10;
 
+  const scratchDeformVertex = { x: 0, y: 0, z: 0 };
+
   const updateTurningSheetGeometry = (slotIndex: number) => {
     const slot = turningSheets[slotIndex];
     if (!slot) return;
@@ -412,6 +414,7 @@ export function createBookRig(
           slot.leftStackY,
           slot.rightStackY,
           slot.liftBias,
+          scratchDeformVertex,
         );
         const f3 = (iy * cols + ix) * 3;
         arr[f3] = p.x;
